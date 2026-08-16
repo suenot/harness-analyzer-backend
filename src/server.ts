@@ -288,8 +288,10 @@ export function createApp(options: {
     try {
       const snapshot = validatePrivateAnalyticsSnapshot(await c.req.json());
       await profileStore.savePrivateAnalytics(identity.subject, snapshot);
+      const aggregate = await profileStore.getPrivateAnalytics(identity.subject);
+      if (!aggregate) throw new Error('Synchronized analytics were not stored');
       // Public data is derived server-side from the same source of truth; raw session data never reaches public routes.
-      await profileStore.saveSnapshot(identity.subject, buildPublicSnapshot(snapshot.sessions, 'details'));
+      await profileStore.saveSnapshot(identity.subject, buildPublicSnapshot(aggregate.sessions, 'details'));
       return c.json({ ok: true, generated_at: snapshot.generated_at, sessions: snapshot.sessions.length, history_included: snapshot.history_included });
     } catch (error) {
       if (error instanceof InvalidPrivateSnapshotError) return c.json({ error: error.message }, 400);
@@ -341,6 +343,25 @@ export function createApp(options: {
     return c.json(getHistoryChart(sessions, { timeframe: c.req.query('timeframe') === '1h' ? '1h' : '1d', groupBy: c.req.query('groupBy') === 'model' ? 'model' : 'harness', days: Number.isNaN(rawDays) ? 30 : Math.max(0, rawDays) }));
   });
   app.get('/api/me/analytics/charts/heatmap', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getHeatmapData(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
+  app.get('/api/me/analytics/charts/devices', async (c) => {
+    const devices = await profileStore.getPrivateAnalyticsDevices(c.get('identity').subject);
+    if (devices.length === 0) return c.json({ error: 'No synchronized analytics.' }, 404);
+    const entries = devices.map(({ device, last_synced_at, snapshot }) => {
+      const sessions = filterSessions(snapshot.sessions, { from: c.req.query('from'), to: c.req.query('to') });
+      return {
+        id: device.id,
+        name: device.name,
+        platform: device.platform,
+        architecture: device.architecture,
+        last_synced_at,
+        cost: parseFloat(sessions.reduce((total, session) => total + session.cost, 0).toFixed(4)),
+        tokens: sessions.reduce((total, session) => total + session.input_tokens + session.output_tokens + session.cache_read + session.cache_write, 0),
+        sessions: sessions.length,
+      };
+    });
+    entries.sort((left, right) => right.cost - left.cost || right.tokens - left.tokens || left.name.localeCompare(right.name) || left.id.localeCompare(right.id));
+    return c.json(entries);
+  });
   app.get('/api/me/analytics/charts/sources', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getSourceStats(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
   app.get('/api/me/analytics/charts/source-usage', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getSourceUsage(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });
   app.get('/api/me/analytics/charts/models', async (c) => { const sessions = await privateSessions(c.get('identity')); return sessions ? c.json(getModelStats(filterSessions(sessions, { from: c.req.query('from'), to: c.req.query('to') }))) : c.json({ error: 'No synchronized analytics.' }, 404); });

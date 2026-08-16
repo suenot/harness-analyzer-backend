@@ -6,6 +6,7 @@ import {
   InvalidHandleError,
   MemoryProfileStore,
   PostgresProfileStore,
+  StaleSnapshotError,
   normalizeHandle,
 } from '../dist/profile-store.js';
 import {
@@ -297,8 +298,95 @@ test('private analytics are writable by a sync token and readable only by their 
   assert.equal(stored.total, 1);
   assert.equal(stored.sessions[0].file, 'remote');
   assert.equal(JSON.stringify(stored).includes('secret prompt'), false);
+  const devices = await app.request('/api/me/analytics/charts/devices', request('alice'));
+  assert.equal(devices.status, 200);
+  assert.deepEqual((await devices.json()).map(device => ({ id: device.id, name: device.name })), [
+    { id: 'legacy', name: 'Legacy device' },
+  ]);
   assert.equal((await app.request('/api/me/analytics/sessions', request('bob'))).status, 404);
   assert.equal((await app.request('/api/me/analytics/sessions', syncRequest(syncToken))).status, 403);
+  assert.equal((await app.request('/api/me/analytics/charts/devices', syncRequest(syncToken))).status, 403);
+});
+
+test('memory store aggregates latest snapshots per device without double-counting replacements', async () => {
+  const store = new MemoryProfileStore();
+  await store.upsertSharing('alice', { handle: 'alice-one' });
+  const first = buildPrivateAnalyticsSnapshot(sessions, false, {
+    id: 'device_alpha', name: 'Server Alpha', platform: 'linux', architecture: 'x64',
+  });
+  first.generated_at = '2026-08-16T10:00:00.000Z';
+  const secondSessions = [{ ...sessions[0], date: '2026-08-01', cost: 4 }];
+  const second = buildPrivateAnalyticsSnapshot(secondSessions, true, {
+    id: 'device_beta', name: 'Server Beta', platform: 'linux', architecture: 'arm64',
+  });
+  second.generated_at = '2026-08-16T10:01:00.000Z';
+  await store.savePrivateAnalytics('alice', first);
+  await store.savePrivateAnalytics('alice', second);
+
+  const replacement = buildPrivateAnalyticsSnapshot([{ ...sessions[0], cost: 7 }], false, first.device);
+  replacement.generated_at = '2026-08-16T10:02:00.000Z';
+  await store.savePrivateAnalytics('alice', replacement);
+
+  const aggregate = await store.getPrivateAnalytics('alice');
+  assert.equal(aggregate.sessions.length, 2);
+  assert.deepEqual(aggregate.sessions.map(session => session.cost).sort((a, b) => a - b), [4, 7]);
+  assert.equal(aggregate.generated_at, replacement.generated_at);
+  assert.equal(aggregate.history_included, true);
+  assert.equal(aggregate.device, undefined);
+  assert.equal((await store.getPrivateAnalyticsDevices('alice')).length, 2);
+
+  const stale = structuredClone(replacement);
+  stale.generated_at = '2026-08-16T09:59:00.000Z';
+  await assert.rejects(() => store.savePrivateAnalytics('alice', stale), StaleSnapshotError);
+});
+
+test('device chart is owner-only, date-filtered, sorted, and absent from public snapshots', async () => {
+  const store = new MemoryProfileStore();
+  const app = appFor(store);
+  const alpha = buildPrivateAnalyticsSnapshot(sessions, false, {
+    id: 'device_alpha', name: 'Server Alpha', platform: 'linux', architecture: 'x64',
+  });
+  const beta = buildPrivateAnalyticsSnapshot([{ ...sessions[0], date: '2026-08-01', cost: 4 }], false, {
+    id: 'device_beta', name: 'Server Beta', platform: 'linux', architecture: 'arm64',
+  });
+  assert.equal((await app.request('/api/me/analytics', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(alpha),
+  }))).status, 200);
+  assert.equal((await app.request('/api/me/analytics', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(beta),
+  }))).status, 200);
+
+  assert.equal((await app.request('/api/me/analytics/charts/devices')).status, 401);
+  assert.equal((await app.request('/api/me/analytics/charts/devices', request('bob'))).status, 404);
+  const response = await app.request('/api/me/analytics/charts/devices?from=2026-08-01', request('alice'));
+  assert.equal(response.status, 200);
+  const entries = await response.json();
+  assert.deepEqual(entries.map(entry => entry.id), ['device_beta', 'device_alpha']);
+  assert.deepEqual(entries[0], {
+    id: 'device_beta',
+    name: 'Server Beta',
+    platform: 'linux',
+    architecture: 'arm64',
+    last_synced_at: entries[0].last_synced_at,
+    cost: 4,
+    tokens: 350,
+    sessions: 1,
+  });
+  assert.equal(entries[1].cost, 0);
+  assert.equal(entries[1].tokens, 0);
+  assert.equal(entries[1].sessions, 0);
+
+  await app.request('/api/me/sharing', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visibility: 'details' }),
+  }));
+  const publicProfile = await app.request('/api/public/users/alice');
+  const publicBody = await publicProfile.json();
+  assert.equal(publicBody.snapshot.totals.total_cost, 6.5);
+  assert.equal(publicBody.snapshot.totals.total_sessions, 2);
+  const encoded = JSON.stringify(publicBody);
+  for (const privateValue of ['device_alpha', 'device_beta', 'Server Alpha', 'Server Beta']) {
+    assert.equal(encoded.includes(privateValue), false, `leaked ${privateValue}`);
+  }
 });
 
 test('snapshot source supports development default, explicit disable, and strict owner exception', async () => {
@@ -333,6 +421,39 @@ test('Postgres store schema initialization is idempotent SQL', async () => {
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS share_profiles/);
   assert.match(calls[0], /CREATE UNIQUE INDEX IF NOT EXISTS share_profiles_handle_lower_idx/);
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS public_snapshots/);
+  assert.match(calls[0], /CREATE TABLE IF NOT EXISTS private_analytics_device_snapshots/);
+  assert.match(calls[0], /PRIMARY KEY \(subject, device_id\)/);
+});
+
+test('Postgres private analytics prefer per-device rows and fall back to the legacy aggregate', async () => {
+  const deviceSnapshot = buildPrivateAnalyticsSnapshot(sessions, false, {
+    id: 'device_alpha', name: 'Server Alpha', platform: 'linux', architecture: 'x64',
+  });
+  let calls = 0;
+  const deviceStore = new PostgresProfileStore({
+    query: async sql => {
+      calls += 1;
+      assert.match(sql, /private_analytics_device_snapshots/);
+      return { rows: [{
+        device_id: 'device_alpha', device_name: 'Server Alpha', platform: 'linux', architecture: 'x64',
+        generated_at: deviceSnapshot.generated_at, uploaded_at: deviceSnapshot.generated_at, snapshot: deviceSnapshot,
+      }], rowCount: 1 };
+    },
+  });
+  assert.equal((await deviceStore.getPrivateAnalytics('alice')).sessions.length, 1);
+  assert.equal(calls, 1, 'legacy aggregate must not be queried when device rows exist');
+
+  const legacySnapshot = buildPrivateAnalyticsSnapshot([{ ...sessions[0], cost: 9 }]);
+  const legacyStore = new PostgresProfileStore({
+    query: async sql => sql.includes('private_analytics_device_snapshots')
+      ? { rows: [], rowCount: 0 }
+      : { rows: [{ generated_at: legacySnapshot.generated_at, uploaded_at: legacySnapshot.generated_at, snapshot: legacySnapshot }], rowCount: 1 },
+  });
+  const legacy = await legacyStore.getPrivateAnalyticsDevices('alice');
+  assert.equal(legacy.length, 1);
+  assert.equal(legacy[0].device.id, 'legacy');
+  assert.equal(legacy[0].device.name, 'Legacy device');
+  assert.equal(legacy[0].snapshot.sessions[0].cost, 9);
 });
 
 test('Postgres store projects details out of totals-only public profiles', async () => {

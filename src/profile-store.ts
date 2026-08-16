@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
 import type { PublicSnapshotV1 } from './public-snapshot.js';
-import type { PrivateAnalyticsSnapshotV1 } from '@claude-stats/core';
+import type { AnalyticsDeviceMetadata, PrivateAnalyticsSnapshotV1 } from '@claude-stats/core';
 
 export type ShareVisibility = 'private' | 'totals' | 'details';
 export type LeaderboardMetric = 'tokens' | 'cost' | 'sessions';
@@ -36,6 +36,12 @@ export interface LeaderboardUser {
   generated_at: string;
 }
 
+export interface PrivateAnalyticsDeviceSnapshot {
+  device: AnalyticsDeviceMetadata;
+  last_synced_at: string;
+  snapshot: PrivateAnalyticsSnapshotV1;
+}
+
 export interface ProfileStore {
   init(): Promise<void>;
   getSharing(subject: string): Promise<SharingProfile | null>;
@@ -43,6 +49,7 @@ export interface ProfileStore {
   saveSnapshot(subject: string, snapshot: PublicSnapshotV1): Promise<void>;
   savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void>;
   getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null>;
+  getPrivateAnalyticsDevices(subject: string): Promise<PrivateAnalyticsDeviceSnapshot[]>;
   getPublicProfile(handle: string): Promise<PublicProfile | null>;
   getLeaderboard(metric: LeaderboardMetric, limit: number): Promise<LeaderboardUser[]>;
   getSubjectForSyncTokenHash(tokenHash: string): Promise<string | null>;
@@ -85,7 +92,7 @@ export function normalizeHandle(value: string): string {
   return handle;
 }
 
-function snapshotHash(snapshot: PublicSnapshotV1): string {
+function snapshotHash(snapshot: unknown): string {
   return createHash('sha256').update(JSON.stringify(snapshot)).digest('hex');
 }
 
@@ -96,7 +103,35 @@ function clone<T>(value: T): T {
 interface MemoryRecord {
   profile: SharingProfile;
   snapshot: PublicSnapshotV1 | null;
+  /** Fallback for records created before per-device storage was introduced. */
   privateAnalytics: PrivateAnalyticsSnapshotV1 | null;
+  privateAnalyticsByDevice: Map<string, PrivateAnalyticsDeviceSnapshot>;
+}
+
+const LEGACY_DEVICE: AnalyticsDeviceMetadata = {
+  id: 'legacy',
+  name: 'Legacy device',
+  platform: 'unknown',
+  architecture: 'unknown',
+};
+
+function deviceFor(snapshot: PrivateAnalyticsSnapshotV1): AnalyticsDeviceMetadata {
+  return clone(snapshot.device || LEGACY_DEVICE);
+}
+
+export function aggregatePrivateAnalytics(
+  devices: PrivateAnalyticsDeviceSnapshot[],
+): PrivateAnalyticsSnapshotV1 | null {
+  if (devices.length === 0) return null;
+  const generatedAt = devices.reduce((latest, current) =>
+    Date.parse(current.snapshot.generated_at) > Date.parse(latest) ? current.snapshot.generated_at : latest,
+  devices[0].snapshot.generated_at);
+  return {
+    schema_version: devices[0].snapshot.schema_version,
+    generated_at: generatedAt,
+    history_included: devices.some(device => device.snapshot.history_included),
+    sessions: devices.flatMap(device => clone(device.snapshot.sessions)),
+  };
 }
 
 export class MemoryProfileStore implements ProfileStore {
@@ -126,7 +161,12 @@ export class MemoryProfileStore implements ProfileStore {
       leaderboard_opt_in: update.leaderboard_opt_in ?? existing?.profile.leaderboard_opt_in ?? false,
       snapshot_generated_at: existing?.snapshot?.generated_at || null,
     };
-    this.records.set(subject, { profile, snapshot: existing?.snapshot || null, privateAnalytics: existing?.privateAnalytics || null });
+    this.records.set(subject, {
+      profile,
+      snapshot: existing?.snapshot || null,
+      privateAnalytics: existing?.privateAnalytics || null,
+      privateAnalyticsByDevice: existing?.privateAnalyticsByDevice || new Map(),
+    });
     this.subjectsByHandle.set(handle, subject);
     return clone(profile);
   }
@@ -144,12 +184,34 @@ export class MemoryProfileStore implements ProfileStore {
   async savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void> {
     const record = this.records.get(subject);
     if (!record) throw new Error('Sharing profile does not exist');
-    if (record.privateAnalytics && Date.parse(snapshot.generated_at) < Date.parse(record.privateAnalytics.generated_at)) throw new StaleSnapshotError();
-    record.privateAnalytics = clone(snapshot);
+    const device = deviceFor(snapshot);
+    const existing = record.privateAnalyticsByDevice.get(device.id);
+    if (existing && Date.parse(snapshot.generated_at) < Date.parse(existing.snapshot.generated_at)) throw new StaleSnapshotError();
+    record.privateAnalyticsByDevice.set(device.id, {
+      device,
+      last_synced_at: new Date().toISOString(),
+      snapshot: clone(snapshot),
+    });
   }
 
   async getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null> {
-    return this.records.get(subject)?.privateAnalytics ? clone(this.records.get(subject)!.privateAnalytics!) : null;
+    const record = this.records.get(subject);
+    if (!record) return null;
+    if (record.privateAnalyticsByDevice.size > 0) {
+      return aggregatePrivateAnalytics([...record.privateAnalyticsByDevice.values()]);
+    }
+    return record.privateAnalytics ? clone(record.privateAnalytics) : null;
+  }
+
+  async getPrivateAnalyticsDevices(subject: string): Promise<PrivateAnalyticsDeviceSnapshot[]> {
+    const record = this.records.get(subject);
+    if (!record) return [];
+    if (record.privateAnalyticsByDevice.size > 0) return [...record.privateAnalyticsByDevice.values()].map(clone);
+    return record.privateAnalytics ? [{
+      device: clone(LEGACY_DEVICE),
+      last_synced_at: record.privateAnalytics.generated_at,
+      snapshot: clone(record.privateAnalytics),
+    }] : [];
   }
 
   async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {
@@ -253,6 +315,21 @@ export class PostgresProfileStore implements ProfileStore {
         snapshot JSONB NOT NULL,
         snapshot_hash TEXT NOT NULL
       );
+      CREATE TABLE IF NOT EXISTS private_analytics_device_snapshots (
+        subject TEXT NOT NULL REFERENCES share_profiles(subject) ON DELETE CASCADE,
+        device_id TEXT NOT NULL,
+        device_name TEXT NOT NULL,
+        platform TEXT NOT NULL,
+        architecture TEXT NOT NULL,
+        schema_version INTEGER NOT NULL,
+        generated_at TIMESTAMPTZ NOT NULL,
+        uploaded_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        snapshot JSONB NOT NULL,
+        snapshot_hash TEXT NOT NULL,
+        PRIMARY KEY (subject, device_id)
+      );
+      CREATE INDEX IF NOT EXISTS private_analytics_device_snapshots_subject_idx
+        ON private_analytics_device_snapshots (subject);
     `);
   }
 
@@ -310,22 +387,50 @@ export class PostgresProfileStore implements ProfileStore {
   }
 
   async savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void> {
+    const device = deviceFor(snapshot);
     const result = await this.pool.query(
-      `INSERT INTO private_analytics_snapshots (subject, schema_version, generated_at, snapshot, snapshot_hash)
-       VALUES ($1, $2, $3, $4::jsonb, $5)
-       ON CONFLICT (subject) DO UPDATE SET schema_version = EXCLUDED.schema_version,
-         generated_at = EXCLUDED.generated_at, uploaded_at = NOW(), snapshot = EXCLUDED.snapshot, snapshot_hash = EXCLUDED.snapshot_hash
-       WHERE private_analytics_snapshots.generated_at <= EXCLUDED.generated_at`,
-      [subject, snapshot.schema_version, snapshot.generated_at, JSON.stringify(snapshot), snapshotHash(snapshot as unknown as PublicSnapshotV1)],
+      `INSERT INTO private_analytics_device_snapshots
+         (subject, device_id, device_name, platform, architecture, schema_version, generated_at, snapshot, snapshot_hash)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+       ON CONFLICT (subject, device_id) DO UPDATE SET
+         device_name = EXCLUDED.device_name,
+         platform = EXCLUDED.platform,
+         architecture = EXCLUDED.architecture,
+         schema_version = EXCLUDED.schema_version,
+         generated_at = EXCLUDED.generated_at,
+         uploaded_at = NOW(),
+         snapshot = EXCLUDED.snapshot,
+         snapshot_hash = EXCLUDED.snapshot_hash
+       WHERE private_analytics_device_snapshots.generated_at <= EXCLUDED.generated_at`,
+      [subject, device.id, device.name, device.platform, device.architecture, snapshot.schema_version,
+        snapshot.generated_at, JSON.stringify(snapshot), snapshotHash(snapshot)],
     );
     if (result.rowCount === 0) throw new StaleSnapshotError();
   }
 
   async getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null> {
+    return aggregatePrivateAnalytics(await this.getPrivateAnalyticsDevices(subject));
+  }
+
+  async getPrivateAnalyticsDevices(subject: string): Promise<PrivateAnalyticsDeviceSnapshot[]> {
     const result = await this.pool.query(
-      `SELECT snapshot FROM private_analytics_snapshots WHERE subject = $1`, [subject],
+      `SELECT device_id, device_name, platform, architecture, generated_at, uploaded_at, snapshot
+         FROM private_analytics_device_snapshots
+        WHERE subject = $1
+        ORDER BY device_id ASC`,
+      [subject],
     );
-    return result.rows[0] ? result.rows[0].snapshot as PrivateAnalyticsSnapshotV1 : null;
+    if (result.rows.length > 0) return result.rows.map(deviceSnapshotFromRow);
+
+    const legacy = await this.pool.query(
+      `SELECT generated_at, uploaded_at, snapshot FROM private_analytics_snapshots WHERE subject = $1`,
+      [subject],
+    );
+    return legacy.rows[0] ? [{
+      device: clone(LEGACY_DEVICE),
+      last_synced_at: new Date(legacy.rows[0].uploaded_at || legacy.rows[0].generated_at).toISOString(),
+      snapshot: legacy.rows[0].snapshot as PrivateAnalyticsSnapshotV1,
+    }] : [];
   }
 
   async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {
@@ -398,6 +503,19 @@ function profileFromRow(row: Record<string, unknown>): SharingProfile {
     visibility: row.visibility as ShareVisibility,
     leaderboard_opt_in: Boolean(row.leaderboard_opt_in),
     snapshot_generated_at: row.generated_at ? new Date(row.generated_at as string | Date).toISOString() : null,
+  };
+}
+
+function deviceSnapshotFromRow(row: Record<string, unknown>): PrivateAnalyticsDeviceSnapshot {
+  return {
+    device: {
+      id: String(row.device_id),
+      name: String(row.device_name),
+      platform: String(row.platform),
+      architecture: String(row.architecture),
+    },
+    last_synced_at: new Date(row.uploaded_at as string | Date).toISOString(),
+    snapshot: row.snapshot as PrivateAnalyticsSnapshotV1,
   };
 }
 

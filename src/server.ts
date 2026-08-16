@@ -22,9 +22,117 @@ import {
   type ShareVisibility,
 } from './profile-store.js';
 import { buildPublicSnapshot, InvalidSnapshotError, validatePublicSnapshot } from './public-snapshot.js';
-import { buildSummary, getProjectStats as getPrivateProjectStats, InvalidPrivateSnapshotError, validatePrivateAnalyticsSnapshot } from '@claude-stats/core';
+import {
+  buildSummary,
+  getProjectStats as getPrivateProjectStats,
+  InvalidPrivateSnapshotError,
+  validatePrivateAnalyticsSnapshot,
+  type Session,
+} from '@claude-stats/core';
 
 type PricingService = Pick<typeof modelPricingService, 'getModelPricing'>;
+const MAX_PUBLIC_PROJECTS = 2_000;
+
+interface PublicSession {
+  date: string;
+  time: string;
+  source: string;
+  cost: number;
+  input_tokens: number;
+  output_tokens: number;
+  cache_read: number;
+  cache_write: number;
+  model: string;
+}
+
+function publicDimension(value: string | undefined, fallback: string, maxLength = 200): string {
+  const label = value?.replace(/[\u0000-\u001f\u007f]/g, ' ').trim().slice(0, maxLength);
+  return !label || Object.prototype.hasOwnProperty.call(Object.prototype, label) ? fallback : label;
+}
+
+function publicProjectLabel(value: string | undefined): string {
+  if (!value) return '(no project)';
+  const normalized = value.replace(/\\/g, '/').replace(/\/+$/, '');
+  const label = normalized.split('/').pop()?.replace(/[\u0000-\u001f\u007f]/g, ' ').trim();
+  if (!label || label === '.' || label === '..') return '(no project)';
+  return publicDimension(label, '(no project)');
+}
+
+function publicSession(session: Session): PublicSession {
+  return {
+    date: session.date,
+    time: session.time,
+    source: publicDimension(session.source, 'Unknown'),
+    cost: session.cost,
+    input_tokens: session.input_tokens,
+    output_tokens: session.output_tokens,
+    cache_read: session.cache_read,
+    cache_write: session.cache_write,
+    model: publicDimension(session.model, 'unknown'),
+  };
+}
+
+function publicProjects(sessions: Session[]) {
+  interface BreakdownValue { usd: number; tokens: number; sessions: number }
+  interface ProjectValue extends BreakdownValue {
+    byModel: Map<string, BreakdownValue>;
+    byHarness: Map<string, BreakdownValue>;
+  }
+  const projects = new Map<string, ProjectValue>();
+  const add = (breakdown: Map<string, BreakdownValue>, key: string, usd: number, tokens: number) => {
+    const value = breakdown.get(key) || { usd: 0, tokens: 0, sessions: 0 };
+    value.usd += usd;
+    value.tokens += tokens;
+    value.sessions++;
+    breakdown.set(key, value);
+  };
+  const allocate = (breakdown: Map<string, BreakdownValue>, totalCents: number) => {
+    const entries = [...breakdown.entries()].map(([key, value]) => {
+      const rawCents = value.usd * 100;
+      const cents = Math.floor(rawCents);
+      return { key, value, cents, remainder: rawCents - cents };
+    });
+    const remaining = totalCents - entries.reduce((sum, entry) => sum + entry.cents, 0);
+    const allocationOrder = [...entries].sort((left, right) =>
+      right.remainder - left.remainder || left.key.localeCompare(right.key));
+    for (let index = 0; index < remaining; index++) allocationOrder[index].cents++;
+    return Object.fromEntries(entries.sort((left, right) => left.key.localeCompare(right.key)).map(entry => [
+      entry.key,
+      { usd: entry.cents / 100, tokens: entry.value.tokens, sessions: entry.value.sessions },
+    ]));
+  };
+
+  for (const session of sessions) {
+    const label = publicProjectLabel(session.cwd);
+    const model = publicDimension(session.model, 'unknown');
+    const harness = publicDimension(session.source, 'Unknown');
+    const tokens = session.input_tokens + session.output_tokens + session.cache_read + session.cache_write;
+    const project = projects.get(label) || {
+      usd: 0, tokens: 0, sessions: 0, byModel: new Map(), byHarness: new Map(),
+    };
+    project.usd += session.cost;
+    project.tokens += tokens;
+    project.sessions++;
+    add(project.byModel, model, session.cost, tokens);
+    add(project.byHarness, harness, session.cost, tokens);
+    projects.set(label, project);
+  }
+
+  return [...projects.entries()].map(([label, project]) => {
+    const totalCents = Math.round(project.usd * 100 + Number.EPSILON * Math.max(1, Math.abs(project.usd * 100)));
+    return {
+      label,
+      cost: totalCents / 100,
+      tokens: project.tokens,
+      sessions: project.sessions,
+      sources: [...project.byHarness.keys()].sort((left, right) => left.localeCompare(right)),
+      models: [...project.byModel.keys()].sort((left, right) => left.localeCompare(right)),
+      byModel: allocate(project.byModel, totalCents),
+      byHarness: allocate(project.byHarness, totalCents),
+    };
+  }).sort((left, right) => right.cost - left.cost || left.label.localeCompare(right.label))
+    .slice(0, MAX_PUBLIC_PROJECTS);
+}
 
 const DEFAULT_ALLOWED_ORIGINS = [
   'https://harness-analyzer.marketmaker.cc',
@@ -160,6 +268,8 @@ export function createApp(options: {
         display_name: identity.username || null,
         visibility: 'private',
         leaderboard_opt_in: false,
+        share_sessions: false,
+        share_projects: false,
       });
     } catch (error) {
       if (!(error instanceof HandleConflictError)) throw error;
@@ -170,6 +280,8 @@ export function createApp(options: {
         display_name: identity.username || null,
         visibility: 'private',
         leaderboard_opt_in: false,
+        share_sessions: false,
+        share_projects: false,
       });
     }
   };
@@ -182,6 +294,30 @@ export function createApp(options: {
     const profile = await profileStore.getPublicProfile(c.req.param('handle'));
     if (!profile) return c.json({ error: 'Not found' }, 404);
     return c.json(profile);
+  });
+
+  app.get('/api/public/users/:handle/sessions', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    const snapshot = await profileStore.getPublicAnalytics(c.req.param('handle'), 'sessions');
+    if (!snapshot) return c.json({ error: 'Not found' }, 404);
+    const filtered = filterSessions(snapshot.sessions, {
+      source: c.req.query('source'), model: c.req.query('model'), from: c.req.query('from'), to: c.req.query('to'),
+      minCost: c.req.query('minCost') ? parseFloat(c.req.query('minCost')!) : undefined,
+    });
+    const limit = Math.min(Math.max(parseInt(c.req.query('limit') || '100', 10) || 100, 1), 500);
+    const offset = Math.max(parseInt(c.req.query('offset') || '0', 10) || 0, 0);
+    const sorted = filtered.sort((left, right) =>
+      right.date.localeCompare(left.date) || right.time.localeCompare(left.time));
+    return c.json({ total: sorted.length, sessions: sorted.slice(offset, offset + limit).map(publicSession) });
+  });
+
+  app.get('/api/public/users/:handle/projects', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
+    const snapshot = await profileStore.getPublicAnalytics(c.req.param('handle'), 'projects');
+    if (!snapshot) return c.json({ error: 'Not found' }, 404);
+    return c.json(publicProjects(snapshot.sessions));
   });
 
   app.get('/api/public/leaderboard', async (c) => {
@@ -229,7 +365,9 @@ export function createApp(options: {
     } catch {
       return c.json({ error: 'Invalid body' }, 400);
     }
-    const allowedKeys = new Set(['handle', 'display_name', 'visibility', 'leaderboard_opt_in']);
+    const allowedKeys = new Set([
+      'handle', 'display_name', 'visibility', 'leaderboard_opt_in', 'share_sessions', 'share_projects',
+    ]);
     if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowedKeys.has(key))) {
       return c.json({ error: 'Invalid body' }, 400);
     }
@@ -245,12 +383,21 @@ export function createApp(options: {
     if (body.leaderboard_opt_in !== undefined && typeof body.leaderboard_opt_in !== 'boolean') {
       return c.json({ error: 'Invalid leaderboard preference' }, 400);
     }
+    if (body.share_sessions !== undefined && typeof body.share_sessions !== 'boolean') {
+      return c.json({ error: 'Invalid sessions sharing preference' }, 400);
+    }
+    if (body.share_projects !== undefined && typeof body.share_projects !== 'boolean') {
+      return c.json({ error: 'Invalid projects sharing preference' }, 400);
+    }
+    const visibility = (body.visibility as ShareVisibility | undefined) ?? current.visibility;
     try {
       const profile = await profileStore.upsertSharing(c.get('identity').subject, {
         handle: body.handle === undefined ? current.handle : body.handle as string,
         display_name: body.display_name as string | null | undefined,
-        visibility: body.visibility as ShareVisibility | undefined,
+        visibility,
         leaderboard_opt_in: body.leaderboard_opt_in as boolean | undefined,
+        share_sessions: visibility === 'details' ? body.share_sessions as boolean | undefined : false,
+        share_projects: visibility === 'details' ? body.share_projects as boolean | undefined : false,
       });
       return c.json(sharingResponse(profile));
     } catch (error) {

@@ -136,6 +136,8 @@ test('memory store defaults private, isolates owners, clones values, and rejects
   const alice = await store.upsertSharing('alice', { handle: 'Alice-One' });
   assert.equal(alice.visibility, 'private');
   assert.equal(alice.leaderboard_opt_in, false);
+  assert.equal(alice.share_sessions, false);
+  assert.equal(alice.share_projects, false);
   await assert.rejects(() => store.upsertSharing('bob', { handle: 'alice-one' }), HandleConflictError);
 
   alice.handle = 'mutated';
@@ -148,13 +150,17 @@ test('memory store defaults private, isolates owners, clones values, and rejects
   assert.equal((await store.getPublicProfile('alice-one')).snapshot.totals.total_cost, 2.5);
 });
 
-test('details to totals downgrade removes stored details immediately', async () => {
+test('details to totals downgrade removes stored details and public page access immediately', async () => {
   const store = new MemoryProfileStore();
-  await store.upsertSharing('alice', { handle: 'alice-one', visibility: 'details' });
+  await store.upsertSharing('alice', {
+    handle: 'alice-one', visibility: 'details', share_sessions: true, share_projects: true,
+  });
   await store.saveSnapshot('alice', snapshot('details'));
   assert.ok((await store.getPublicProfile('alice-one')).snapshot.details);
 
-  await store.upsertSharing('alice', { handle: 'alice-one', visibility: 'totals' });
+  const totals = await store.upsertSharing('alice', { handle: 'alice-one', visibility: 'totals' });
+  assert.equal(totals.share_sessions, false);
+  assert.equal(totals.share_projects, false);
   assert.equal((await store.getPublicProfile('alice-one')).snapshot.details, undefined);
   await store.upsertSharing('alice', { handle: 'alice-one', visibility: 'private' });
   assert.equal(await store.getPublicProfile('alice-one'), null);
@@ -188,6 +194,28 @@ test('public routes bypass auth and collector readiness while private/nonexisten
   assert.equal((await app.request('/api/public/users/bob-one')).status, 404);
   assert.equal((await app.request('/api/public/users/missing-user')).status, 404);
   assert.equal((await app.request('/api/public/leaderboard')).status, 200);
+});
+
+test('public analytics pages use the same 404 for unknown, private, totals, and disabled profiles', async () => {
+  const store = new MemoryProfileStore();
+  for (const [subject, handle, visibility] of [
+    ['private-id', 'private-user', 'private'],
+    ['totals-id', 'totals-user', 'totals'],
+    ['disabled-id', 'disabled-user', 'details'],
+  ]) {
+    await store.upsertSharing(subject, { handle, visibility });
+    await store.saveSnapshot(subject, snapshot('details'));
+    await store.savePrivateAnalytics(subject, buildPrivateAnalyticsSnapshot(sessions));
+  }
+  const app = appFor(store);
+  for (const handle of ['missing-user', 'private-user', 'totals-user', 'disabled-user']) {
+    for (const page of ['sessions', 'projects']) {
+      const response = await app.request(`/api/public/users/${handle}/${page}`);
+      assert.equal(response.status, 404);
+      assert.equal(response.headers.get('Cache-Control'), 'no-store');
+      assert.deepEqual(await response.json(), { error: 'Not found' });
+    }
+  }
 });
 
 test('status reports profile storage initialization failure without exposing an error', async () => {
@@ -308,6 +336,203 @@ test('private analytics are writable by a sync token and readable only by their 
   assert.equal((await app.request('/api/me/analytics/charts/devices', syncRequest(syncToken))).status, 403);
 });
 
+test('public page preferences require booleans and are forced off outside details visibility', async () => {
+  const app = appFor(new MemoryProfileStore());
+  for (const [key, value] of [['share_sessions', 'yes'], ['share_projects', 1]]) {
+    const response = await app.request('/api/me/sharing', request('alice', {
+      method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ [key]: value }),
+    }));
+    assert.equal(response.status, 400);
+  }
+
+  const privateResponse = await app.request('/api/me/sharing', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ share_sessions: true, share_projects: true }),
+  }));
+  assert.deepEqual(
+    (({ share_sessions, share_projects }) => ({ share_sessions, share_projects }))(await privateResponse.json()),
+    { share_sessions: false, share_projects: false },
+  );
+
+  const detailsResponse = await app.request('/api/me/sharing', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ visibility: 'details', share_sessions: true, share_projects: true }),
+  }));
+  assert.deepEqual(
+    (({ share_sessions, share_projects }) => ({ share_sessions, share_projects }))(await detailsResponse.json()),
+    { share_sessions: true, share_projects: true },
+  );
+
+  const downgraded = await app.request('/api/me/sharing', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visibility: 'totals' }),
+  }));
+  assert.deepEqual(
+    (({ share_sessions, share_projects }) => ({ share_sessions, share_projects }))(await downgraded.json()),
+    { share_sessions: false, share_projects: false },
+  );
+});
+
+test('public sessions and projects use independent gates and never leak private analytics fields', async () => {
+  const store = new MemoryProfileStore();
+  const app = appFor(store);
+  const { events: _events, ...baseSession } = sessions[0];
+  const sensitiveSnapshot = {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    history_included: true,
+    device: {
+      id: 'device_secret_01',
+      name: 'Secret Fleet Server',
+      platform: 'private-linux',
+      architecture: 'secret-arm64',
+    },
+    sessions: [
+      {
+        ...baseSession,
+        cwd: '/Users/alice/secret-project',
+      },
+      {
+        ...baseSession,
+        time: '11:45',
+        cost: 1,
+        cwd: 'C:\\fleet\\other-customer\\secret-project',
+        file: 'C:\\private\\second-session.jsonl',
+        title: 'Second private title',
+        sessionId: 'internal-session-two',
+        history: [{ role: 'ai', text: 'never publish this response' }],
+      },
+    ],
+  };
+  assert.equal((await app.request('/api/me/analytics', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(sensitiveSnapshot),
+  }))).status, 200);
+
+  const closedSessions = await app.request('/api/public/users/alice/sessions');
+  const closedProjects = await app.request('/api/public/users/alice/projects');
+  assert.equal(closedSessions.status, 404);
+  assert.equal(closedProjects.status, 404);
+  assert.deepEqual(await closedSessions.json(), { error: 'Not found' });
+  assert.deepEqual(await closedProjects.json(), { error: 'Not found' });
+
+  await app.request('/api/me/sharing', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ visibility: 'details', share_sessions: true }),
+  }));
+  const publicProfile = await (await app.request('/api/public/users/alice')).json();
+  assert.equal(publicProfile.share_sessions, true);
+  assert.equal(publicProfile.share_projects, false);
+
+  const sessionsResponse = await app.request('/api/public/users/alice/sessions?source=Codex&limit=1&offset=1');
+  assert.equal(sessionsResponse.status, 200);
+  assert.equal(sessionsResponse.headers.get('Cache-Control'), 'no-store');
+  const publicSessions = await sessionsResponse.json();
+  assert.equal(publicSessions.total, 2);
+  assert.equal(publicSessions.sessions.length, 1);
+  assert.deepEqual(Object.keys(publicSessions.sessions[0]).sort(), [
+    'cache_read', 'cache_write', 'cost', 'date', 'input_tokens', 'model', 'output_tokens', 'source', 'time',
+  ]);
+  assert.equal((await app.request('/api/public/users/alice/projects')).status, 404);
+
+  const sessionsJson = JSON.stringify(publicSessions);
+  for (const secret of [
+    '/Users/alice', 'secret-project', '/secret/session.jsonl', 'Secret product name', 'secret-session-id',
+    'secret prompt', 'never publish this response', 'device_secret_01', 'Secret Fleet Server',
+    'private-linux', 'secret-arm64', 'history', 'hours', 'sessionId', 'file', 'cwd',
+  ]) {
+    assert.equal(sessionsJson.includes(secret), false, `sessions leaked ${secret}`);
+  }
+
+  await app.request('/api/me/sharing', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ share_projects: true }),
+  }));
+  const projectsResponse = await app.request('/api/public/users/alice/projects');
+  assert.equal(projectsResponse.status, 200);
+  assert.equal(projectsResponse.headers.get('Cache-Control'), 'no-store');
+  const projects = await projectsResponse.json();
+  assert.equal(projects.length, 1, 'matching basenames must be aggregated without exposing distinct paths');
+  assert.equal(projects[0].label, 'secret-project');
+  assert.equal(Object.hasOwn(projects[0], 'cwd'), false);
+  assert.equal(projects[0].sessions, 2);
+  assert.equal(projects[0].cost, 3.5);
+  const projectsJson = JSON.stringify(projects);
+  for (const secret of [
+    '/Users/alice', 'other-customer', '/secret/session.jsonl', 'Secret product name', 'secret-session-id',
+    'secret prompt', 'never publish this response', 'device_secret_01', 'Secret Fleet Server',
+    'private-linux', 'secret-arm64', 'history', 'hours', 'sessionId', 'file', 'cwd',
+  ]) {
+    assert.equal(projectsJson.includes(secret), false, `projects leaked ${secret}`);
+  }
+
+  await app.request('/api/me/sharing', request('alice', {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ visibility: 'totals' }),
+  }));
+  assert.equal((await app.request('/api/public/users/alice/sessions')).status, 404);
+  assert.equal((await app.request('/api/public/users/alice/projects')).status, 404);
+});
+
+test('public project aggregation safely handles object prototype key labels', async () => {
+  const store = new MemoryProfileStore();
+  await store.upsertSharing('hostile', {
+    handle: 'hostile-user', visibility: 'details', share_sessions: true, share_projects: true,
+  });
+  await store.saveSnapshot('hostile', snapshot('details'));
+  await store.savePrivateAnalytics('hostile', {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    history_included: false,
+    sessions: [
+      { ...sessions[0], source: 'constructor', model: '__proto__', cwd: '/private/toString' },
+      { ...sessions[0], source: 'hasOwnProperty', model: 'valueOf', cwd: '/private/__defineGetter__' },
+    ],
+  });
+  const app = appFor(store);
+
+  const sessionsResponse = await app.request('/api/public/users/hostile-user/sessions');
+  assert.equal(sessionsResponse.status, 200);
+  const publicSessions = await sessionsResponse.json();
+  assert.deepEqual(publicSessions.sessions.map(session => [session.source, session.model]), [
+    ['Unknown', 'unknown'], ['Unknown', 'unknown'],
+  ]);
+
+  const projectsResponse = await app.request('/api/public/users/hostile-user/projects');
+  assert.equal(projectsResponse.status, 200);
+  const projects = await projectsResponse.json();
+  assert.equal(projects.length, 1);
+  assert.deepEqual(projects[0], {
+    label: '(no project)',
+    cost: 5,
+    tokens: 700,
+    sessions: 2,
+    sources: ['Unknown'],
+    models: ['unknown'],
+    byModel: { unknown: { usd: 5, tokens: 700, sessions: 2 } },
+    byHarness: { Unknown: { usd: 5, tokens: 700, sessions: 2 } },
+  });
+});
+
+test('public projects cap unauthenticated responses at 2000 deterministic aggregates', async () => {
+  const store = new MemoryProfileStore();
+  await store.upsertSharing('large', {
+    handle: 'large-user', visibility: 'details', share_projects: true,
+  });
+  await store.saveSnapshot('large', snapshot('details'));
+  await store.savePrivateAnalytics('large', {
+    schema_version: 1,
+    generated_at: new Date().toISOString(),
+    history_included: false,
+    sessions: Array.from({ length: 2_005 }, (_, index) => ({
+      ...sessions[0],
+      cwd: `/private/project-${String(index).padStart(4, '0')}`,
+    })),
+  });
+  const response = await appFor(store).request('/api/public/users/large-user/projects');
+  assert.equal(response.status, 200);
+  const projects = await response.json();
+  assert.equal(projects.length, 2_000);
+  assert.equal(projects[0].label, 'project-0000');
+  assert.equal(projects.at(-1).label, 'project-1999');
+});
+
 test('memory store aggregates latest snapshots per device without double-counting replacements', async () => {
   const store = new MemoryProfileStore();
   await store.upsertSharing('alice', { handle: 'alice-one' });
@@ -420,6 +645,8 @@ test('Postgres store schema initialization is idempotent SQL', async () => {
   assert.equal(calls.length, 2);
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS share_profiles/);
   assert.match(calls[0], /CREATE UNIQUE INDEX IF NOT EXISTS share_profiles_handle_lower_idx/);
+  assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_sessions/);
+  assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_projects/);
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS public_snapshots/);
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS private_analytics_device_snapshots/);
   assert.match(calls[0], /PRIMARY KEY \(subject, device_id\)/);
@@ -468,4 +695,44 @@ test('Postgres store projects details out of totals-only public profiles', async
   const result = await store.getPublicProfile('alice-one');
   assert.equal(result.snapshot.details, undefined);
   assert.ok(stored.details);
+});
+
+test('Postgres public analytics gates snapshot reads in each query', async () => {
+  const calls = [];
+  const store = new PostgresProfileStore({
+    query: async (sql, parameters) => {
+      calls.push({ sql, parameters });
+      return { rows: [], rowCount: 0 };
+    },
+  });
+  assert.equal(await store.getPublicAnalytics('alice-one', 'sessions'), null);
+  assert.equal(calls.length, 2);
+  for (const { sql, parameters } of calls) {
+    assert.match(sql, /JOIN public_snapshots ps USING \(subject\)/);
+    assert.match(sql, /p\.visibility = 'details'/);
+    assert.match(sql, /p\.share_sessions = true/);
+    assert.deepEqual(parameters, ['alice-one']);
+  }
+  assert.match(calls[0].sql, /JOIN private_analytics_device_snapshots d USING \(subject\)/);
+  assert.match(calls[1].sql, /JOIN private_analytics_snapshots a USING \(subject\)/);
+
+  const deviceSnapshot = buildPrivateAnalyticsSnapshot(sessions, false, {
+    id: 'device_alpha', name: 'Server Alpha', platform: 'linux', architecture: 'x64',
+  });
+  const deviceCalls = [];
+  const deviceStore = new PostgresProfileStore({
+    query: async (sql, parameters) => {
+      deviceCalls.push({ sql, parameters });
+      return { rows: [{
+        device_id: 'device_alpha', device_name: 'Server Alpha', platform: 'linux', architecture: 'x64',
+        generated_at: deviceSnapshot.generated_at, uploaded_at: deviceSnapshot.generated_at, snapshot: deviceSnapshot,
+      }], rowCount: 1 };
+    },
+  });
+  const aggregate = await deviceStore.getPublicAnalytics('alice-one', 'projects');
+  assert.equal(aggregate.sessions.length, 1);
+  assert.equal(deviceCalls.length, 1, 'gated device read must not be followed by an ungated analytics fetch');
+  assert.match(deviceCalls[0].sql, /p\.visibility = 'details'/);
+  assert.match(deviceCalls[0].sql, /p\.share_projects = true/);
+  assert.match(deviceCalls[0].sql, /JOIN private_analytics_device_snapshots d USING \(subject\)/);
 });

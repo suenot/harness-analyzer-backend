@@ -5,6 +5,7 @@ import type { AnalyticsDeviceMetadata, PrivateAnalyticsSnapshotV1 } from '@claud
 
 export type ShareVisibility = 'private' | 'totals' | 'details';
 export type LeaderboardMetric = 'tokens' | 'cost' | 'sessions';
+export type PublicAnalyticsPage = 'sessions' | 'projects';
 
 export interface SharingProfile {
   subject: string;
@@ -12,6 +13,8 @@ export interface SharingProfile {
   display_name: string | null;
   visibility: ShareVisibility;
   leaderboard_opt_in: boolean;
+  share_sessions: boolean;
+  share_projects: boolean;
   snapshot_generated_at: string | null;
 }
 
@@ -20,12 +23,16 @@ export interface SharingUpdate {
   display_name?: string | null;
   visibility?: ShareVisibility;
   leaderboard_opt_in?: boolean;
+  share_sessions?: boolean;
+  share_projects?: boolean;
 }
 
 export interface PublicProfile {
   handle: string;
   display_name: string | null;
   visibility: Exclude<ShareVisibility, 'private'>;
+  share_sessions: boolean;
+  share_projects: boolean;
   snapshot: PublicSnapshotV1;
 }
 
@@ -50,6 +57,7 @@ export interface ProfileStore {
   savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void>;
   getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null>;
   getPrivateAnalyticsDevices(subject: string): Promise<PrivateAnalyticsDeviceSnapshot[]>;
+  getPublicAnalytics(handle: string, page: PublicAnalyticsPage): Promise<PrivateAnalyticsSnapshotV1 | null>;
   getPublicProfile(handle: string): Promise<PublicProfile | null>;
   getLeaderboard(metric: LeaderboardMetric, limit: number): Promise<LeaderboardUser[]>;
   getSubjectForSyncTokenHash(tokenHash: string): Promise<string | null>;
@@ -153,12 +161,19 @@ export class MemoryProfileStore implements ProfileStore {
     if (owner && owner !== subject) throw new HandleConflictError();
     const existing = this.records.get(subject);
     if (existing && existing.profile.handle !== handle) this.subjectsByHandle.delete(existing.profile.handle);
+    const visibility = update.visibility ?? existing?.profile.visibility ?? 'private';
     const profile: SharingProfile = {
       subject,
       handle,
       display_name: update.display_name !== undefined ? update.display_name : existing?.profile.display_name || null,
-      visibility: update.visibility ?? existing?.profile.visibility ?? 'private',
+      visibility,
       leaderboard_opt_in: update.leaderboard_opt_in ?? existing?.profile.leaderboard_opt_in ?? false,
+      share_sessions: visibility === 'details'
+        ? update.share_sessions ?? existing?.profile.share_sessions ?? false
+        : false,
+      share_projects: visibility === 'details'
+        ? update.share_projects ?? existing?.profile.share_projects ?? false
+        : false,
       snapshot_generated_at: existing?.snapshot?.generated_at || null,
     };
     this.records.set(subject, {
@@ -214,6 +229,20 @@ export class MemoryProfileStore implements ProfileStore {
     }] : [];
   }
 
+  async getPublicAnalytics(rawHandle: string, page: PublicAnalyticsPage): Promise<PrivateAnalyticsSnapshotV1 | null> {
+    let handle: string;
+    try {
+      handle = normalizeHandle(rawHandle);
+    } catch {
+      return null;
+    }
+    const subject = this.subjectsByHandle.get(handle);
+    const record = subject ? this.records.get(subject) : undefined;
+    const enabled = page === 'sessions' ? record?.profile.share_sessions : record?.profile.share_projects;
+    if (!record?.snapshot || record.profile.visibility !== 'details' || !enabled) return null;
+    return this.getPrivateAnalytics(subject!);
+  }
+
   async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {
     let handle: string;
     try {
@@ -230,6 +259,8 @@ export class MemoryProfileStore implements ProfileStore {
       handle: record.profile.handle,
       display_name: record.profile.display_name,
       visibility: record.profile.visibility,
+      share_sessions: record.profile.visibility === 'details' && record.profile.share_sessions,
+      share_projects: record.profile.visibility === 'details' && record.profile.share_projects,
       snapshot,
     } as PublicProfile);
   }
@@ -283,9 +314,13 @@ export class PostgresProfileStore implements ProfileStore {
         display_name TEXT,
         visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private', 'totals', 'details')),
         leaderboard_opt_in BOOLEAN NOT NULL DEFAULT false,
+        share_sessions BOOLEAN NOT NULL DEFAULT false,
+        share_projects BOOLEAN NOT NULL DEFAULT false,
         created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
+      ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_sessions BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_projects BOOLEAN NOT NULL DEFAULT false;
       CREATE UNIQUE INDEX IF NOT EXISTS share_profiles_handle_lower_idx ON share_profiles (LOWER(handle));
       CREATE TABLE IF NOT EXISTS public_snapshots (
         subject TEXT PRIMARY KEY REFERENCES share_profiles(subject) ON DELETE CASCADE,
@@ -336,6 +371,7 @@ export class PostgresProfileStore implements ProfileStore {
   async getSharing(subject: string): Promise<SharingProfile | null> {
     const result = await this.pool.query(
       `SELECT p.subject, p.handle, p.display_name, p.visibility, p.leaderboard_opt_in,
+              p.share_sessions, p.share_projects,
               s.generated_at
          FROM share_profiles p LEFT JOIN public_snapshots s USING (subject)
         WHERE p.subject = $1`,
@@ -348,15 +384,32 @@ export class PostgresProfileStore implements ProfileStore {
     const handle = normalizeHandle(update.handle);
     try {
       await this.pool.query(
-        `INSERT INTO share_profiles (subject, handle, display_name, visibility, leaderboard_opt_in)
-         VALUES ($1, $2, $3, COALESCE($4, 'private'), COALESCE($5, false))
+        `INSERT INTO share_profiles
+           (subject, handle, display_name, visibility, leaderboard_opt_in, share_sessions, share_projects)
+         VALUES (
+           $1, $2, $3, COALESCE($4, 'private'), COALESCE($5, false),
+           CASE WHEN COALESCE($4, 'private') = 'details' THEN COALESCE($6, false) ELSE false END,
+           CASE WHEN COALESCE($4, 'private') = 'details' THEN COALESCE($7, false) ELSE false END
+         )
          ON CONFLICT (subject) DO UPDATE SET
            handle = EXCLUDED.handle,
-           display_name = CASE WHEN $6 THEN EXCLUDED.display_name ELSE share_profiles.display_name END,
+           display_name = CASE WHEN $8 THEN EXCLUDED.display_name ELSE share_profiles.display_name END,
            visibility = COALESCE($4, share_profiles.visibility),
            leaderboard_opt_in = COALESCE($5, share_profiles.leaderboard_opt_in),
+           share_sessions = CASE
+             WHEN COALESCE($4, share_profiles.visibility) = 'details' THEN COALESCE($6, share_profiles.share_sessions)
+             ELSE false
+           END,
+           share_projects = CASE
+             WHEN COALESCE($4, share_profiles.visibility) = 'details' THEN COALESCE($7, share_profiles.share_projects)
+             ELSE false
+           END,
            updated_at = NOW()`,
-        [subject, handle, update.display_name ?? null, update.visibility ?? null, update.leaderboard_opt_in ?? null, update.display_name !== undefined],
+        [
+          subject, handle, update.display_name ?? null, update.visibility ?? null,
+          update.leaderboard_opt_in ?? null, update.share_sessions ?? null, update.share_projects ?? null,
+          update.display_name !== undefined,
+        ],
       );
     } catch (error) {
       if ((error as { code?: string }).code === '23505') throw new HandleConflictError();
@@ -433,6 +486,37 @@ export class PostgresProfileStore implements ProfileStore {
     }] : [];
   }
 
+  async getPublicAnalytics(rawHandle: string, page: PublicAnalyticsPage): Promise<PrivateAnalyticsSnapshotV1 | null> {
+    let handle: string;
+    try {
+      handle = normalizeHandle(rawHandle);
+    } catch {
+      return null;
+    }
+    const flag = page === 'sessions' ? 'share_sessions' : 'share_projects';
+    const devices = await this.pool.query(
+      `SELECT d.device_id, d.device_name, d.platform, d.architecture,
+              d.generated_at, d.uploaded_at, d.snapshot
+         FROM share_profiles p
+         JOIN public_snapshots ps USING (subject)
+         JOIN private_analytics_device_snapshots d USING (subject)
+        WHERE LOWER(p.handle) = $1 AND p.visibility = 'details' AND p.${flag} = true
+        ORDER BY d.device_id ASC`,
+      [handle],
+    );
+    if (devices.rows.length > 0) return aggregatePrivateAnalytics(devices.rows.map(deviceSnapshotFromRow));
+
+    const legacy = await this.pool.query(
+      `SELECT a.snapshot
+         FROM share_profiles p
+         JOIN public_snapshots ps USING (subject)
+         JOIN private_analytics_snapshots a USING (subject)
+        WHERE LOWER(p.handle) = $1 AND p.visibility = 'details' AND p.${flag} = true`,
+      [handle],
+    );
+    return legacy.rows[0] ? legacy.rows[0].snapshot as PrivateAnalyticsSnapshotV1 : null;
+  }
+
   async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {
     let handle: string;
     try {
@@ -441,7 +525,7 @@ export class PostgresProfileStore implements ProfileStore {
       return null;
     }
     const result = await this.pool.query(
-      `SELECT p.handle, p.display_name, p.visibility, s.snapshot
+      `SELECT p.handle, p.display_name, p.visibility, p.share_sessions, p.share_projects, s.snapshot
          FROM share_profiles p JOIN public_snapshots s USING (subject)
         WHERE LOWER(p.handle) = $1 AND p.visibility <> 'private'`,
       [handle],
@@ -453,6 +537,8 @@ export class PostgresProfileStore implements ProfileStore {
       handle: result.rows[0].handle,
       display_name: result.rows[0].display_name,
       visibility: result.rows[0].visibility,
+      share_sessions: result.rows[0].visibility === 'details' && Boolean(result.rows[0].share_sessions),
+      share_projects: result.rows[0].visibility === 'details' && Boolean(result.rows[0].share_projects),
       snapshot,
     };
   }
@@ -502,6 +588,8 @@ function profileFromRow(row: Record<string, unknown>): SharingProfile {
     display_name: row.display_name === null ? null : String(row.display_name),
     visibility: row.visibility as ShareVisibility,
     leaderboard_opt_in: Boolean(row.leaderboard_opt_in),
+    share_sessions: Boolean(row.share_sessions),
+    share_projects: Boolean(row.share_projects),
     snapshot_generated_at: row.generated_at ? new Date(row.generated_at as string | Date).toISOString() : null,
   };
 }

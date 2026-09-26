@@ -1,5 +1,5 @@
 import * as path from 'node:path';
-import { collect, getDirectoryFingerprint, type CollectorResult } from '@claude-stats/core';
+import { collect, getDirectoryFingerprint, type CollectorResult } from '@harness-analyzer/core';
 
 export {
   filterSessions,
@@ -17,7 +17,7 @@ export {
   getCacheStats,
   getSourceStats,
   getSourceUsage,
-} from '@claude-stats/core';
+} from '@harness-analyzer/core';
 export type {
   ProjectEntry,
   HistoryTimeframe,
@@ -32,7 +32,7 @@ export type {
   CacheExpiryBreakdown,
   CacheExpiryIncident,
   CacheExpiryStats,
-} from '@claude-stats/core';
+} from '@harness-analyzer/core';
 
 let cachedResult: CollectorResult | null = null;
 let lastFingerprint = '';

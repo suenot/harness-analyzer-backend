@@ -80,7 +80,7 @@ export function createModelPricingService(deps: {
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
       headers: {
         Accept: 'application/json',
-        'User-Agent': 'claude-usage-stats model-pricing service',
+        'User-Agent': 'harness-analyzer model-pricing service',
       },
     });
 

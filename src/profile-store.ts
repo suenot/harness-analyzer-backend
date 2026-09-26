@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Pool } from 'pg';
 import type { PublicSnapshotV1 } from './public-snapshot.js';
-import type { AnalyticsDeviceMetadata, PrivateAnalyticsSnapshotV1 } from '@claude-stats/core';
+import type { AnalyticsDeviceMetadata, PrivateAnalyticsSnapshotV1 } from '@harness-analyzer/core';
 
 export type ShareVisibility = 'private' | 'totals' | 'details';
 export type LeaderboardMetric = 'tokens' | 'cost' | 'sessions';

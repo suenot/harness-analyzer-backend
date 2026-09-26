@@ -14,7 +14,7 @@ import {
   buildPublicSnapshot,
   validatePublicSnapshot,
 } from '../dist/public-snapshot.js';
-import { buildPrivateAnalyticsSnapshot } from '@claude-stats/core';
+import { buildPrivateAnalyticsSnapshot } from '@harness-analyzer/core';
 
 process.env.NODE_ENV = 'test';
 const { createApp } = await import('../dist/server.js');

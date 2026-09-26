@@ -28,7 +28,7 @@ import {
   InvalidPrivateSnapshotError,
   validatePrivateAnalyticsSnapshot,
   type Session,
-} from '@claude-stats/core';
+} from '@harness-analyzer/core';
 
 type PricingService = Pick<typeof modelPricingService, 'getModelPricing'>;
 const MAX_PUBLIC_PROJECTS = 2_000;

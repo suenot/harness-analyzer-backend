@@ -1,6 +1,6 @@
 {
-  "name": "@claude-stats/backend",
-  "version": "0.3.0",
+  "name": "@harness-analyzer/backend",
+  "version": "0.3.1",
   "type": "module",
   "scripts": {
     "build": "tsc",
@@ -9,7 +9,7 @@
     "start": "node dist/server.js"
   },
   "dependencies": {
-    "@claude-stats/core": "*",
+    "@harness-analyzer/core": "*",
     "@hono/node-server": "^2.0.12",
     "hono": "^4.12.33",
     "jose": "^6.2.5",

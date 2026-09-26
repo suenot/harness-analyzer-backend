@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
-import { getPricing } from '@claude-stats/core';
+import { getPricing } from '@harness-analyzer/core';
 import { collectClaudeCode } from '../../core/dist/parsers/claude-code.js';
 import { getCacheExpiryStats } from '../dist/services/data-service.js';
 

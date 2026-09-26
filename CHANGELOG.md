@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.3.3] - 2026-09-27
+
+### Fixed
+
+- Use updated core pricing and corrected Codex token counts for locally collected analytics.
+
 ## [0.3.2] - 2026-09-27
 
 ### Fixed

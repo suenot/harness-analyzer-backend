@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.3.2] - 2026-09-27
+
+### Fixed
+
+- Use corrected core model attribution in hosted analytics instead of showing unidentified models as GLM 5.2.
+
 ## [0.3.1] - 2026-09-26
 
 ### Changed

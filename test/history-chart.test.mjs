@@ -177,7 +177,7 @@ test('model usage aggregates cost, tokens, and sessions while preserving the leg
 
   assert.deepEqual(usage, {
     'claude-3-5-sonnet': { cost: 4.24, sessions: 2, tokens: 110 },
-    'GLM 5.2': { cost: 0.34, sessions: 1, tokens: 50 },
+    Unknown: { cost: 0.34, sessions: 1, tokens: 50 },
   });
   assert.deepEqual(dataService.getModelStats([
     sessions[0],
@@ -185,7 +185,7 @@ test('model usage aggregates cost, tokens, and sessions while preserving the leg
     { ...sessions[1], model: '', cost: 0.335 },
   ]), {
     'claude-3-5-sonnet': 4.24,
-    'GLM 5.2': 0.34,
+    Unknown: 0.34,
   });
 });
 

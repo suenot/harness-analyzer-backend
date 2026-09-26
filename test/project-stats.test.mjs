@@ -91,11 +91,11 @@ test('project stats aggregate totals and breakdowns by cwd and preserve cost sor
       tokens: 178,
       sessions: 4,
       sources: ['Claude Code', 'Codex', 'Unknown'],
-      models: ['claude-sonnet', 'gpt-5', 'GLM 5.2'],
+      models: ['claude-sonnet', 'gpt-5', 'Unknown'],
       byModel: {
         'claude-sonnet': { usd: 3.33, tokens: 110, sessions: 2 },
         'gpt-5': { usd: 1.44, tokens: 26, sessions: 1 },
-        'GLM 5.2': { usd: 0.23, tokens: 42, sessions: 1 },
+        Unknown: { usd: 0.23, tokens: 42, sessions: 1 },
       },
       byHarness: {
         'Claude Code': { usd: 3.33, tokens: 110, sessions: 2 },

@@ -6,6 +6,12 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.3.4] - 2026-09-27
+
+### Fixed
+
+- Support explicit device aliases so a reinstalled computer appears once without discarding older sessions or double-counting overlaps.
+
 ## [0.3.3] - 2026-09-27
 
 ### Fixed

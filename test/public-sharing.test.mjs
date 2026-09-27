@@ -649,7 +649,38 @@ test('Postgres store schema initialization is idempotent SQL', async () => {
   assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_projects/);
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS public_snapshots/);
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS private_analytics_device_snapshots/);
+  assert.match(calls[0], /CREATE TABLE IF NOT EXISTS private_analytics_device_aliases/);
   assert.match(calls[0], /PRIMARY KEY \(subject, device_id\)/);
+});
+
+test('Postgres merges an aliased reinstall into one device and keeps old unique sessions', async () => {
+  const currentDevice = { id: 'device_current', name: 'Current Mac', platform: 'darwin', architecture: 'arm64' };
+  const oldDevice = { id: 'device_old', name: 'Old Mac', platform: 'darwin', architecture: 'arm64' };
+  const current = buildPrivateAnalyticsSnapshot(sessions, false, currentDevice);
+  current.generated_at = '2026-09-27T10:00:00.000Z';
+  const old = buildPrivateAnalyticsSnapshot([
+    { ...sessions[0], model: 'unknown', cost: 0 },
+    { ...sessions[0], date: '2026-03-16', model: 'gpt-5.6-sol' },
+  ], false, oldDevice);
+  old.generated_at = '2026-09-18T10:00:00.000Z';
+  const rows = [
+    { device_id: oldDevice.id, device_name: oldDevice.name, platform: 'darwin', architecture: 'arm64',
+      generated_at: old.generated_at, uploaded_at: old.generated_at, snapshot: old, canonical_device_id: currentDevice.id },
+    { device_id: currentDevice.id, device_name: currentDevice.name, platform: 'darwin', architecture: 'arm64',
+      generated_at: current.generated_at, uploaded_at: current.generated_at, snapshot: current, canonical_device_id: null },
+  ];
+  const store = new PostgresProfileStore({ query: async () => ({ rows, rowCount: rows.length }) });
+  const devices = await store.getPrivateAnalyticsDevices('alice');
+  assert.equal(devices.length, 1);
+  assert.deepEqual(devices[0].device, currentDevice);
+  assert.deepEqual(devices[0].snapshot.sessions.map(session => [session.date, session.model]), [
+    ['2026-07-31', 'gpt-5.6-sol'], ['2026-03-16', 'gpt-5.6-sol'],
+  ]);
+  assert.equal((await store.getPrivateAnalytics('alice')).sessions.length, 2);
+  assert.equal((await store.getPublicAnalytics('alice-one', 'sessions')).sessions.length, 2);
+
+  current.sessions.push({ ...current.sessions[0], date: '2026-09-27' });
+  assert.equal((await store.getPrivateAnalytics('alice')).sessions.length, 3, 'new syncs retain old unique history');
 });
 
 test('Postgres private analytics prefer per-device rows and fall back to the legacy aggregate', async () => {

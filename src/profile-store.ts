@@ -142,6 +142,54 @@ export function aggregatePrivateAnalytics(
   };
 }
 
+function sessionFingerprint(session: PrivateAnalyticsSnapshotV1['sessions'][number]): string {
+  return JSON.stringify([
+    session.date, session.time, session.source, session.cwd,
+    session.input_tokens, session.output_tokens, session.cache_read, session.cache_write,
+  ]);
+}
+
+function deviceSnapshotsFromRows(rows: Record<string, unknown>[]): PrivateAnalyticsDeviceSnapshot[] {
+  const groups = new Map<string, PrivateAnalyticsDeviceSnapshot[]>();
+  for (const row of rows) {
+    const snapshot = deviceSnapshotFromRow(row);
+    const canonicalId = String(row.canonical_device_id || snapshot.device.id);
+    const group = groups.get(canonicalId) || [];
+    group.push(snapshot);
+    groups.set(canonicalId, group);
+  }
+  return [...groups].map(([canonicalId, group]) => {
+    if (group.length === 1 && group[0].device.id === canonicalId) return group[0];
+    // Prefer the current installation's data when a reinstalled device has the same session.
+    group.sort((a, b) => Number(b.device.id === canonicalId) - Number(a.device.id === canonicalId)
+      || Date.parse(b.snapshot.generated_at) - Date.parse(a.snapshot.generated_at));
+    const preferred = group[0];
+    const sessions: PrivateAnalyticsSnapshotV1['sessions'] = [];
+    const seen = new Set<string>();
+    for (const member of group) {
+      const memberKeys: string[] = [];
+      for (const session of member.snapshot.sessions) {
+        const key = sessionFingerprint(session);
+        if (!seen.has(key)) sessions.push(clone(session));
+        memberKeys.push(key);
+      }
+      for (const key of memberKeys) seen.add(key);
+    }
+    const device = { ...preferred.device, id: canonicalId };
+    return {
+      device,
+      last_synced_at: group.reduce((latest, member) => member.last_synced_at > latest ? member.last_synced_at : latest, preferred.last_synced_at),
+      snapshot: {
+        ...preferred.snapshot,
+        device,
+        generated_at: group.reduce((latest, member) => member.snapshot.generated_at > latest ? member.snapshot.generated_at : latest, preferred.snapshot.generated_at),
+        history_included: group.some(member => member.snapshot.history_included),
+        sessions,
+      },
+    };
+  });
+}
+
 export class MemoryProfileStore implements ProfileStore {
   private readonly records = new Map<string, MemoryRecord>();
   private readonly subjectsByHandle = new Map<string, string>();
@@ -365,6 +413,15 @@ export class PostgresProfileStore implements ProfileStore {
       );
       CREATE INDEX IF NOT EXISTS private_analytics_device_snapshots_subject_idx
         ON private_analytics_device_snapshots (subject);
+      CREATE TABLE IF NOT EXISTS private_analytics_device_aliases (
+        subject TEXT NOT NULL,
+        alias_device_id TEXT NOT NULL,
+        canonical_device_id TEXT NOT NULL,
+        PRIMARY KEY (subject, alias_device_id),
+        FOREIGN KEY (subject, alias_device_id) REFERENCES private_analytics_device_snapshots (subject, device_id) ON DELETE CASCADE,
+        FOREIGN KEY (subject, canonical_device_id) REFERENCES private_analytics_device_snapshots (subject, device_id) ON DELETE CASCADE,
+        CHECK (alias_device_id <> canonical_device_id)
+      );
     `);
   }
 
@@ -467,13 +524,16 @@ export class PostgresProfileStore implements ProfileStore {
 
   async getPrivateAnalyticsDevices(subject: string): Promise<PrivateAnalyticsDeviceSnapshot[]> {
     const result = await this.pool.query(
-      `SELECT device_id, device_name, platform, architecture, generated_at, uploaded_at, snapshot
-         FROM private_analytics_device_snapshots
-        WHERE subject = $1
-        ORDER BY device_id ASC`,
+      `SELECT d.device_id, d.device_name, d.platform, d.architecture, d.generated_at, d.uploaded_at,
+              d.snapshot, a.canonical_device_id
+         FROM private_analytics_device_snapshots d
+         LEFT JOIN private_analytics_device_aliases a
+           ON a.subject = d.subject AND a.alias_device_id = d.device_id
+        WHERE d.subject = $1
+        ORDER BY d.device_id ASC`,
       [subject],
     );
-    if (result.rows.length > 0) return result.rows.map(deviceSnapshotFromRow);
+    if (result.rows.length > 0) return deviceSnapshotsFromRows(result.rows);
 
     const legacy = await this.pool.query(
       `SELECT generated_at, uploaded_at, snapshot FROM private_analytics_snapshots WHERE subject = $1`,
@@ -496,15 +556,17 @@ export class PostgresProfileStore implements ProfileStore {
     const flag = page === 'sessions' ? 'share_sessions' : 'share_projects';
     const devices = await this.pool.query(
       `SELECT d.device_id, d.device_name, d.platform, d.architecture,
-              d.generated_at, d.uploaded_at, d.snapshot
+              d.generated_at, d.uploaded_at, d.snapshot, a.canonical_device_id
          FROM share_profiles p
          JOIN public_snapshots ps USING (subject)
          JOIN private_analytics_device_snapshots d USING (subject)
+         LEFT JOIN private_analytics_device_aliases a
+           ON a.subject = d.subject AND a.alias_device_id = d.device_id
         WHERE LOWER(p.handle) = $1 AND p.visibility = 'details' AND p.${flag} = true
         ORDER BY d.device_id ASC`,
       [handle],
     );
-    if (devices.rows.length > 0) return aggregatePrivateAnalytics(devices.rows.map(deviceSnapshotFromRow));
+    if (devices.rows.length > 0) return aggregatePrivateAnalytics(deviceSnapshotsFromRows(devices.rows));
 
     const legacy = await this.pool.query(
       `SELECT a.snapshot

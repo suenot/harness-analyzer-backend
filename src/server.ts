@@ -4,6 +4,7 @@ import { bodyLimit } from 'hono/body-limit';
 import { cors } from 'hono/cors';
 import { createHash, randomBytes } from 'node:crypto';
 import { ForbiddenError, hasHarnessRole, verifyHarnessAccess, type AuthIdentity, type AuthVerifier } from './auth.js';
+import { createAuthGroupsProvider, GROUP_ID_RE, type AuthGroupsProvider } from './auth-groups.js';
 import {
   getData, refreshData, filterSessions, getSessionById,
   getProjectStats, getDailyChart, getDailyModelChart, getHistoryChart, getHeatmapData, getModelStats, getModelUsage, getSourceStats, getSourceUsage,
@@ -19,6 +20,8 @@ import {
   StaleSnapshotError,
   type LeaderboardMetric,
   type ProfileStore,
+  type ProfileViewer,
+  type ShareAudience,
   type ShareVisibility,
 } from './profile-store.js';
 import { buildPublicSnapshot, InvalidSnapshotError, validatePublicSnapshot } from './public-snapshot.js';
@@ -152,6 +155,7 @@ export function createApp(options: {
   modelPricingService?: PricingService;
   dataProvider?: typeof getData;
   authVerifier?: AuthVerifier;
+  authGroupsProvider?: AuthGroupsProvider;
   allowedOrigins?: string[];
   profileStore?: ProfileStore;
   snapshotExportEnabled?: boolean;
@@ -161,6 +165,7 @@ export function createApp(options: {
   const pricing = options.modelPricingService ?? modelPricingService;
   const dataProvider = options.dataProvider ?? getData;
   const authVerifier = options.authVerifier ?? verifyHarnessAccess;
+  const authGroupsProvider = options.authGroupsProvider ?? createAuthGroupsProvider();
   const profileStore = options.profileStore ?? createProfileStoreFromEnv();
   const profileStoreReady = profileStore.init().then(() => true, () => false);
   const snapshotExportEnabled = options.snapshotExportEnabled ?? (
@@ -231,7 +236,7 @@ export function createApp(options: {
   // Return 503 while data is loading
   app.use('/api/*', async (c, next) => {
     const independent = c.req.path === '/api/status' || c.req.path.startsWith('/api/public/') ||
-      c.req.path === '/api/models/pricing' || c.req.path === '/api/me/sharing' ||
+      c.req.path === '/api/models/pricing' || c.req.path === '/api/me/sharing' || c.req.path.startsWith('/api/me/sharing/') ||
       c.req.path === '/api/me/public-snapshot' || c.req.path.startsWith('/api/me/analytics');
     if (!ready() && !independent) {
       return c.json({ loading: true, message: 'Collecting data, please wait...' }, 503);
@@ -288,10 +293,34 @@ export function createApp(options: {
 
   const sharingResponse = ({ subject: _subject, ...profile }: Awaited<ReturnType<typeof ensureSharing>>) => profile;
 
+  const sharedAccess = async (handle: string, authorization = '') => {
+    const token = authorization.startsWith('Bearer ') ? authorization.slice(7).trim() : '';
+    let viewer: ProfileViewer | undefined;
+    if (token) {
+      try {
+        const identity = await authVerifier(token);
+        viewer = { subject: identity.subject, email: identity.email, group_ids: [] };
+      } catch { /* Invalid tokens have only anonymous access. */ }
+    }
+    let profile = await profileStore.getPublicProfile(handle, viewer);
+    if (!profile && viewer) {
+      try {
+        viewer.group_ids = (await authGroupsProvider(token)).map(group => group.id);
+        profile = await profileStore.getPublicProfile(handle, viewer);
+      } catch { /* Group access fails closed, without disclosing the profile. */ }
+    }
+    return { profile, viewer };
+  };
+
+  app.use('/api/public/users/*', async (c, next) => {
+    c.header('Vary', 'Authorization');
+    await next();
+  });
+
   app.get('/api/public/users/:handle', async (c) => {
     c.header('Cache-Control', 'no-store');
     if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
-    const profile = await profileStore.getPublicProfile(c.req.param('handle'));
+    const { profile } = await sharedAccess(c.req.param('handle'), c.req.header('Authorization'));
     if (!profile) return c.json({ error: 'Not found' }, 404);
     return c.json(profile);
   });
@@ -299,7 +328,9 @@ export function createApp(options: {
   app.get('/api/public/users/:handle/sessions', async (c) => {
     c.header('Cache-Control', 'no-store');
     if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
-    const snapshot = await profileStore.getPublicAnalytics(c.req.param('handle'), 'sessions');
+    const { profile, viewer } = await sharedAccess(c.req.param('handle'), c.req.header('Authorization'));
+    if (!profile) return c.json({ error: 'Not found' }, 404);
+    const snapshot = await profileStore.getPublicAnalytics(c.req.param('handle'), 'sessions', viewer);
     if (!snapshot) return c.json({ error: 'Not found' }, 404);
     const filtered = filterSessions(snapshot.sessions, {
       source: c.req.query('source'), model: c.req.query('model'), from: c.req.query('from'), to: c.req.query('to'),
@@ -315,7 +346,9 @@ export function createApp(options: {
   app.get('/api/public/users/:handle/projects', async (c) => {
     c.header('Cache-Control', 'no-store');
     if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
-    const snapshot = await profileStore.getPublicAnalytics(c.req.param('handle'), 'projects');
+    const { profile, viewer } = await sharedAccess(c.req.param('handle'), c.req.header('Authorization'));
+    if (!profile) return c.json({ error: 'Not found' }, 404);
+    const snapshot = await profileStore.getPublicAnalytics(c.req.param('handle'), 'projects', viewer);
     if (!snapshot) return c.json({ error: 'Not found' }, 404);
     return c.json(publicProjects(snapshot.sessions));
   });
@@ -340,6 +373,16 @@ export function createApp(options: {
     c.header('Cache-Control', 'no-store');
     if (!await waitForProfileStore()) return c.json({ error: 'Profile storage unavailable' }, 503);
     return c.json(sharingResponse(await ensureSharing(c.get('identity'))));
+  });
+
+  app.get('/api/me/sharing/groups', async (c) => {
+    c.header('Cache-Control', 'no-store');
+    try {
+      const token = c.req.header('Authorization')!.slice(7).trim();
+      return c.json({ groups: await authGroupsProvider(token) });
+    } catch {
+      return c.json({ error: 'Groups are unavailable. Try again shortly.' }, 503);
+    }
   });
 
   app.post('/api/me/sync-token', async (c) => {
@@ -367,6 +410,7 @@ export function createApp(options: {
     }
     const allowedKeys = new Set([
       'handle', 'display_name', 'visibility', 'leaderboard_opt_in', 'share_sessions', 'share_projects',
+      'audience', 'allowed_emails', 'allowed_group_ids',
     ]);
     if (!body || typeof body !== 'object' || Array.isArray(body) || Object.keys(body).some(key => !allowedKeys.has(key))) {
       return c.json({ error: 'Invalid body' }, 400);
@@ -377,7 +421,7 @@ export function createApp(options: {
         (typeof body.display_name !== 'string' || body.display_name.length > 80 || /[\u0000-\u001f\u007f]/.test(body.display_name))) {
       return c.json({ error: 'Invalid display name' }, 400);
     }
-    if (body.visibility !== undefined && !['private', 'totals', 'details'].includes(String(body.visibility))) {
+    if (body.visibility !== undefined && (typeof body.visibility !== 'string' || !['private', 'totals', 'details'].includes(body.visibility))) {
       return c.json({ error: 'Invalid visibility' }, 400);
     }
     if (body.leaderboard_opt_in !== undefined && typeof body.leaderboard_opt_in !== 'boolean') {
@@ -390,12 +434,46 @@ export function createApp(options: {
       return c.json({ error: 'Invalid projects sharing preference' }, 400);
     }
     const visibility = (body.visibility as ShareVisibility | undefined) ?? current.visibility;
+    if (body.audience !== undefined && body.audience !== 'public' && body.audience !== 'selected') {
+      return c.json({ error: 'Invalid audience' }, 400);
+    }
+    for (const key of ['allowed_emails', 'allowed_group_ids'] as const) {
+      const values = body[key];
+      if (values !== undefined && (!Array.isArray(values) || values.length > 100 || values.some(value =>
+        typeof value !== 'string' || (key === 'allowed_emails'
+          ? value.length > 254 || !/^[^\s@,;\u0000-\u001f\u007f]+@[^\s@,;\u0000-\u001f\u007f]+\.[^\s@,;\u0000-\u001f\u007f]+$/.test(value.trim())
+          : !GROUP_ID_RE.test(value))))) {
+        return c.json({ error: `Invalid ${key === 'allowed_emails' ? 'friend emails' : 'group IDs'}` }, 400);
+      }
+    }
+    const audience = (body.audience as ShareAudience | undefined) ?? current.audience;
+    const allowedEmails = body.allowed_emails === undefined ? current.allowed_emails
+      : [...new Set((body.allowed_emails as string[]).map(email => email.trim().toLowerCase()))];
+    const allowedGroupIds = body.allowed_group_ids === undefined ? current.allowed_group_ids
+      : [...new Set((body.allowed_group_ids as string[]).map(id => id.toLowerCase()))];
+    if (audience === 'selected' && visibility !== 'private' && allowedEmails.length + allowedGroupIds.length === 0) {
+      return c.json({ error: 'Choose at least one friend or group' }, 400);
+    }
+    const newGroupIds = allowedGroupIds.filter(id => !current.allowed_group_ids.includes(id));
+    if (newGroupIds.length > 0) {
+      try {
+        const groups = await authGroupsProvider(c.req.header('Authorization')!.slice(7).trim());
+        if (newGroupIds.some(id => !groups.some(group => group.id === id))) {
+          return c.json({ error: 'Choose groups you belong to' }, 400);
+        }
+      } catch {
+        return c.json({ error: 'Groups are unavailable. Try again shortly.' }, 503);
+      }
+    }
     try {
       const profile = await profileStore.upsertSharing(c.get('identity').subject, {
         handle: body.handle === undefined ? current.handle : body.handle as string,
         display_name: body.display_name as string | null | undefined,
         visibility,
-        leaderboard_opt_in: body.leaderboard_opt_in as boolean | undefined,
+        audience,
+        allowed_emails: allowedEmails,
+        allowed_group_ids: allowedGroupIds,
+        leaderboard_opt_in: audience === 'public' && visibility !== 'private' ? body.leaderboard_opt_in as boolean | undefined : false,
         share_sessions: visibility === 'details' ? body.share_sessions as boolean | undefined : false,
         share_projects: visibility === 'details' ? body.share_projects as boolean | undefined : false,
       });

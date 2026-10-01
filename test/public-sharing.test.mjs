@@ -72,8 +72,9 @@ function syncRequest(token, init = {}) {
 
 function appFor(store, options = {}) {
   const identities = {
-    alice: { subject: 'alice-id', username: 'alice', services: { 'harness-analyzer': 'user' } },
-    bob: { subject: 'bob-id', username: 'bob', services: { 'harness-analyzer': 'superuser' } },
+    alice: { subject: 'alice-id', username: 'alice', email: 'alice@example.com', services: { 'harness-analyzer': 'user' } },
+    bob: { subject: 'bob-id', username: 'bob', email: ' Bob@Example.com ', services: { 'harness-analyzer': 'superuser' } },
+    carol: { subject: 'carol-id', username: 'carol', email: 'carol@example.com', services: { 'harness-analyzer': 'user' } },
     admin: { subject: 'admin-id', username: 'root-user', services: { 'harness-analyzer': 'admin' } },
     outsider: { subject: 'out-id', username: 'out', services: {} },
   };
@@ -81,6 +82,7 @@ function appFor(store, options = {}) {
     isReady: options.isReady || (() => true),
     dataProvider: () => ({ sessions, summary: {}, sourceResults: {} }),
     profileStore: store,
+    authGroupsProvider: options.authGroupsProvider || (async () => []),
     authVerifier: async token => {
       if (!identities[token]) throw new Error('invalid');
       return identities[token];
@@ -88,6 +90,18 @@ function appFor(store, options = {}) {
     snapshotExportEnabled: options.snapshotExportEnabled,
     snapshotExportOwnerSubject: options.snapshotExportOwnerSubject,
   });
+}
+
+function sharingPut(token, body) {
+  return request(token, {
+    method: 'PUT', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+}
+
+const GROUP_ID = 'bd92d55c-24a5-41bc-9e78-40b9c515462c';
+const OTHER_GROUP_ID = 'b5c035af-032c-4fee-a3de-5c6ddbc94c93';
+function group(id = GROUP_ID, is_owner = true) {
+  return { id, name: 'Friends', member_count: 2, is_owner };
 }
 
 test('snapshot builder publishes aggregates without raw sessions, projects, or incidents', () => {
@@ -216,6 +230,148 @@ test('public analytics pages use the same 404 for unknown, private, totals, and 
       assert.deepEqual(await response.json(), { error: 'Not found' });
     }
   }
+});
+
+test('selected friends see shared pages while other viewers get the same 404 as a missing profile', async () => {
+  const store = new MemoryProfileStore();
+  const app = appFor(store);
+  const privateAnalytics = buildPrivateAnalyticsSnapshot(sessions);
+  await store.upsertSharing('alice-id', {
+    handle: 'alice-one', visibility: 'details', audience: 'selected',
+    allowed_emails: ['bob@example.com'], share_sessions: true, share_projects: true,
+  });
+  await store.saveSnapshot('alice-id', snapshot('details'));
+  await store.savePrivateAnalytics('alice-id', privateAnalytics);
+
+  for (const token of ['alice', 'bob']) {
+    for (const page of ['', '/sessions', '/projects']) {
+      const response = await app.request(`/api/public/users/alice-one${page}`, request(token));
+      assert.equal(response.status, 200, `${token} ${page}`);
+      const body = await response.json();
+      const encoded = JSON.stringify(body);
+      assert.equal(encoded.includes('bob@example.com'), false);
+      assert.equal(encoded.includes('allowed_emails'), false);
+      assert.equal(encoded.includes('allowed_group_ids'), false);
+    }
+  }
+
+  for (const token of [null, 'carol', 'invalid']) {
+    for (const page of ['', '/sessions', '/projects']) {
+      const response = await app.request(`/api/public/users/alice-one${page}`, request(token));
+      assert.equal(response.status, 404, `${token} ${page}`);
+      assert.equal(response.headers.get('Cache-Control'), 'no-store');
+      assert.deepEqual(await response.json(), { error: 'Not found' });
+    }
+  }
+  const missing = await app.request('/api/public/users/missing-user');
+  assert.deepEqual(await missing.json(), { error: 'Not found' });
+});
+
+test('selected group access tracks current membership and fails closed on group outages', async () => {
+  const store = new MemoryProfileStore();
+  const memberships = new Map([['alice', [group()]], ['bob', [group(GROUP_ID, false)]]]);
+  let unavailable = false;
+  const app = appFor(store, { authGroupsProvider: async token => {
+    if (unavailable) throw new Error('auth service unavailable');
+    return memberships.get(token) || [];
+  } });
+  assert.equal((await app.request('/api/me/sharing', sharingPut('alice', {
+    visibility: 'details', audience: 'selected', allowed_group_ids: [GROUP_ID],
+    share_sessions: true, share_projects: true,
+  }))).status, 200);
+  await store.saveSnapshot('alice-id', snapshot('details'));
+  await store.savePrivateAnalytics('alice-id', buildPrivateAnalyticsSnapshot(sessions));
+
+  for (const page of ['', '/sessions', '/projects']) {
+    assert.equal((await app.request(`/api/public/users/alice${page}`, request('bob'))).status, 200);
+  }
+  memberships.set('bob', []);
+  for (const page of ['', '/sessions', '/projects']) {
+    assert.equal((await app.request(`/api/public/users/alice${page}`, request('bob'))).status, 404);
+  }
+  memberships.set('bob', [group(GROUP_ID, false)]);
+  unavailable = true;
+  for (const page of ['', '/sessions', '/projects']) {
+    const response = await app.request(`/api/public/users/alice${page}`, request('bob'));
+    assert.equal(response.status, 404);
+    assert.deepEqual(await response.json(), { error: 'Not found' });
+  }
+  assert.equal((await app.request('/api/public/users/alice', request('alice'))).status, 200);
+});
+
+test('selected profiles stay off the leaderboard and switching audiences changes access immediately', async () => {
+  const store = new MemoryProfileStore();
+  const app = appFor(store);
+  await store.upsertSharing('alice-id', { handle: 'alice', visibility: 'details', leaderboard_opt_in: true });
+  await store.saveSnapshot('alice-id', snapshot('details'));
+  assert.equal((await app.request('/api/public/users/alice')).status, 200);
+  assert.deepEqual((await (await app.request('/api/public/leaderboard')).json()).users.map(user => user.handle), ['alice']);
+
+  const selected = await app.request('/api/me/sharing', sharingPut('alice', {
+    audience: 'selected', allowed_emails: ['bob@example.com'], leaderboard_opt_in: true,
+  }));
+  assert.equal(selected.status, 200);
+  assert.equal((await selected.json()).leaderboard_opt_in, false);
+  assert.equal((await app.request('/api/public/users/alice')).status, 404);
+  assert.equal((await app.request('/api/public/users/alice', request('bob'))).status, 200);
+  assert.deepEqual((await (await app.request('/api/public/leaderboard')).json()).users, []);
+
+  const publicAgain = await app.request('/api/me/sharing', sharingPut('alice', {
+    audience: 'public', leaderboard_opt_in: true,
+  }));
+  assert.equal(publicAgain.status, 200);
+  assert.equal((await app.request('/api/public/users/alice')).status, 200);
+  assert.deepEqual((await (await app.request('/api/public/leaderboard')).json()).users.map(user => user.handle), ['alice']);
+});
+
+test('selected audience validates recipients and newly added groups before saving', async () => {
+  const store = new MemoryProfileStore();
+  const app = appFor(store, { authGroupsProvider: async token => token === 'alice' ? [group(GROUP_ID, false)] : [] });
+  const invalidBodies = [
+    { audience: 'selected', visibility: 'details' },
+    { audience: 'unknown' },
+    { allowed_emails: 'bob@example.com' },
+    { allowed_emails: ['not-an-email'] },
+    { allowed_emails: [null] },
+    { allowed_group_ids: 'bad' },
+    { allowed_group_ids: ['not-a-uuid'] },
+    { audience: 'selected', visibility: 'details', allowed_group_ids: [OTHER_GROUP_ID] },
+  ];
+  for (const body of invalidBodies) {
+    const response = await app.request('/api/me/sharing', sharingPut('alice', body));
+    assert.equal(response.status, 400, JSON.stringify(body));
+  }
+  const valid = await app.request('/api/me/sharing', sharingPut('alice', {
+    audience: 'selected', visibility: 'details',
+    allowed_emails: [' Bob@Example.com ', 'bob@example.com'], allowed_group_ids: [GROUP_ID],
+  }));
+  assert.equal(valid.status, 200);
+  const profile = await valid.json();
+  assert.deepEqual(profile.allowed_emails, ['bob@example.com']);
+  assert.deepEqual(profile.allowed_group_ids, [GROUP_ID]);
+  assert.equal(profile.audience, 'selected');
+
+  const afterInvalid = await store.getSharing('alice-id');
+  assert.deepEqual(afterInvalid.allowed_group_ids, [GROUP_ID]);
+  assert.equal((await app.request('/api/me/sharing', sharingPut('alice', {
+    allowed_group_ids: [GROUP_ID, OTHER_GROUP_ID],
+  }))).status, 400);
+  assert.deepEqual((await store.getSharing('alice-id')).allowed_group_ids, [GROUP_ID]);
+});
+
+test('group listing and new group selection fail closed when auth groups are unavailable', async () => {
+  const store = new MemoryProfileStore();
+  const app = appFor(store, { authGroupsProvider: async () => { throw new Error('auth outage details'); } });
+  const groups = await app.request('/api/me/sharing/groups', request('alice'));
+  assert.equal(groups.status, 503);
+  assert.equal(JSON.stringify(await groups.json()).includes('auth outage details'), false);
+
+  const update = await app.request('/api/me/sharing', sharingPut('alice', {
+    visibility: 'details', audience: 'selected', allowed_group_ids: [GROUP_ID],
+  }));
+  assert.equal(update.status, 503);
+  assert.equal((await store.getSharing('alice-id')).visibility, 'private');
+  assert.deepEqual((await store.getSharing('alice-id')).allowed_group_ids, []);
 });
 
 test('status reports profile storage initialization failure without exposing an error', async () => {
@@ -644,6 +800,9 @@ test('Postgres store schema initialization is idempotent SQL', async () => {
   await store.init();
   assert.equal(calls.length, 2);
   assert.match(calls[0], /CREATE TABLE IF NOT EXISTS share_profiles/);
+  assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS audience/);
+  assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS allowed_emails/);
+  assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS allowed_group_ids/);
   assert.match(calls[0], /CREATE UNIQUE INDEX IF NOT EXISTS share_profiles_handle_lower_idx/);
   assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_sessions/);
   assert.match(calls[0], /ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_projects/);
@@ -718,7 +877,7 @@ test('Postgres store projects details out of totals-only public profiles', async
   const stored = snapshot('details');
   const pool = {
     query: async () => ({
-      rows: [{ handle: 'alice-one', display_name: 'Alice', visibility: 'totals', snapshot: structuredClone(stored) }],
+      rows: [{ handle: 'alice-one', display_name: 'Alice', visibility: 'totals', audience: 'public', snapshot: structuredClone(stored) }],
       rowCount: 1,
     }),
   };
@@ -742,7 +901,9 @@ test('Postgres public analytics gates snapshot reads in each query', async () =>
     assert.match(sql, /JOIN public_snapshots ps USING \(subject\)/);
     assert.match(sql, /p\.visibility = 'details'/);
     assert.match(sql, /p\.share_sessions = true/);
-    assert.deepEqual(parameters, ['alice-one']);
+    assert.match(sql, /p\.audience = 'public'/);
+    assert.match(sql, /p\.allowed_group_ids && \$4::text\[\]/);
+    assert.deepEqual(parameters, ['alice-one', null, null, []]);
   }
   assert.match(calls[0].sql, /JOIN private_analytics_device_snapshots d USING \(subject\)/);
   assert.match(calls[1].sql, /JOIN private_analytics_snapshots a USING \(subject\)/);
@@ -766,4 +927,15 @@ test('Postgres public analytics gates snapshot reads in each query', async () =>
   assert.match(deviceCalls[0].sql, /p\.visibility = 'details'/);
   assert.match(deviceCalls[0].sql, /p\.share_projects = true/);
   assert.match(deviceCalls[0].sql, /JOIN private_analytics_device_snapshots d USING \(subject\)/);
+
+  calls.length = 0;
+  await store.getPublicAnalytics('alice-one', 'projects', {
+    subject: 'bob-id', email: ' BOB@Example.com ', group_ids: [GROUP_ID],
+  });
+  assert.equal(calls.length, 2);
+  for (const { sql, parameters } of calls) {
+    assert.match(sql, /p\.share_projects = true/);
+    assert.match(sql, /p\.subject = \$2/);
+    assert.deepEqual(parameters, ['alice-one', 'bob-id', 'bob@example.com', [GROUP_ID]]);
+  }
 });

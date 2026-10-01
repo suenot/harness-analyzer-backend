@@ -6,6 +6,16 @@ The format is based on Keep a Changelog, and this project adheres to Semantic Ve
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-10-02
+
+### Added
+
+- Add independent profile audiences with friend email and auth-service group allowlists, enforcing access across shared dashboards, Sessions and Projects.
+
+### Security
+
+- Check current group membership on each group-based read, fail closed when auth groups are unavailable, keep recipient lists private, and exclude selected profiles from public rankings.
+
 ## [0.3.4] - 2026-09-27
 
 ### Fixed

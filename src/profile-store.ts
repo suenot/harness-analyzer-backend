@@ -4,6 +4,12 @@ import type { PublicSnapshotV1 } from './public-snapshot.js';
 import type { AnalyticsDeviceMetadata, PrivateAnalyticsSnapshotV1 } from '@harness-analyzer/core';
 
 export type ShareVisibility = 'private' | 'totals' | 'details';
+export type ShareAudience = 'public' | 'selected';
+export interface ProfileViewer {
+  subject: string;
+  email?: string;
+  group_ids: string[];
+}
 export type LeaderboardMetric = 'tokens' | 'cost' | 'sessions';
 export type PublicAnalyticsPage = 'sessions' | 'projects';
 
@@ -12,6 +18,9 @@ export interface SharingProfile {
   handle: string;
   display_name: string | null;
   visibility: ShareVisibility;
+  audience: ShareAudience;
+  allowed_emails: string[];
+  allowed_group_ids: string[];
   leaderboard_opt_in: boolean;
   share_sessions: boolean;
   share_projects: boolean;
@@ -22,6 +31,9 @@ export interface SharingUpdate {
   handle?: string;
   display_name?: string | null;
   visibility?: ShareVisibility;
+  audience?: ShareAudience;
+  allowed_emails?: string[];
+  allowed_group_ids?: string[];
   leaderboard_opt_in?: boolean;
   share_sessions?: boolean;
   share_projects?: boolean;
@@ -31,6 +43,7 @@ export interface PublicProfile {
   handle: string;
   display_name: string | null;
   visibility: Exclude<ShareVisibility, 'private'>;
+  audience: ShareAudience;
   share_sessions: boolean;
   share_projects: boolean;
   snapshot: PublicSnapshotV1;
@@ -57,8 +70,8 @@ export interface ProfileStore {
   savePrivateAnalytics(subject: string, snapshot: PrivateAnalyticsSnapshotV1): Promise<void>;
   getPrivateAnalytics(subject: string): Promise<PrivateAnalyticsSnapshotV1 | null>;
   getPrivateAnalyticsDevices(subject: string): Promise<PrivateAnalyticsDeviceSnapshot[]>;
-  getPublicAnalytics(handle: string, page: PublicAnalyticsPage): Promise<PrivateAnalyticsSnapshotV1 | null>;
-  getPublicProfile(handle: string): Promise<PublicProfile | null>;
+  getPublicAnalytics(handle: string, page: PublicAnalyticsPage, viewer?: ProfileViewer): Promise<PrivateAnalyticsSnapshotV1 | null>;
+  getPublicProfile(handle: string, viewer?: ProfileViewer): Promise<PublicProfile | null>;
   getLeaderboard(metric: LeaderboardMetric, limit: number): Promise<LeaderboardUser[]>;
   getSubjectForSyncTokenHash(tokenHash: string): Promise<string | null>;
   setSyncTokenHash(subject: string, tokenHash: string): Promise<void>;
@@ -106,6 +119,22 @@ function snapshotHash(snapshot: unknown): string {
 
 function clone<T>(value: T): T {
   return structuredClone(value);
+}
+
+function audienceAllows(profile: SharingProfile, viewer?: ProfileViewer): boolean {
+  return profile.audience === 'public' || !!viewer && (
+    profile.subject === viewer.subject
+    || !!viewer.email && profile.allowed_emails.includes(viewer.email.trim().toLowerCase())
+    || profile.allowed_group_ids.some(id => viewer.group_ids.includes(id))
+  );
+}
+
+// Keep the audience gate in every query that reads shared analytics.
+const AUDIENCE_SQL = `(p.audience = 'public' OR p.subject = $2
+  OR (p.audience = 'selected' AND ($3 = ANY(p.allowed_emails) OR p.allowed_group_ids && $4::text[])))`;
+
+function viewerParameters(handle: string, viewer?: ProfileViewer): unknown[] {
+  return [handle, viewer?.subject ?? null, viewer?.email?.trim().toLowerCase() ?? null, viewer?.group_ids ?? []];
 }
 
 interface MemoryRecord {
@@ -210,12 +239,17 @@ export class MemoryProfileStore implements ProfileStore {
     const existing = this.records.get(subject);
     if (existing && existing.profile.handle !== handle) this.subjectsByHandle.delete(existing.profile.handle);
     const visibility = update.visibility ?? existing?.profile.visibility ?? 'private';
+    const audience = update.audience ?? existing?.profile.audience ?? 'public';
     const profile: SharingProfile = {
       subject,
       handle,
       display_name: update.display_name !== undefined ? update.display_name : existing?.profile.display_name || null,
       visibility,
-      leaderboard_opt_in: update.leaderboard_opt_in ?? existing?.profile.leaderboard_opt_in ?? false,
+      audience,
+      allowed_emails: clone(update.allowed_emails ?? existing?.profile.allowed_emails ?? []),
+      allowed_group_ids: clone(update.allowed_group_ids ?? existing?.profile.allowed_group_ids ?? []),
+      leaderboard_opt_in: audience === 'public' && visibility !== 'private'
+        && (update.leaderboard_opt_in ?? existing?.profile.leaderboard_opt_in ?? false),
       share_sessions: visibility === 'details'
         ? update.share_sessions ?? existing?.profile.share_sessions ?? false
         : false,
@@ -277,7 +311,7 @@ export class MemoryProfileStore implements ProfileStore {
     }] : [];
   }
 
-  async getPublicAnalytics(rawHandle: string, page: PublicAnalyticsPage): Promise<PrivateAnalyticsSnapshotV1 | null> {
+  async getPublicAnalytics(rawHandle: string, page: PublicAnalyticsPage, viewer?: ProfileViewer): Promise<PrivateAnalyticsSnapshotV1 | null> {
     let handle: string;
     try {
       handle = normalizeHandle(rawHandle);
@@ -287,11 +321,11 @@ export class MemoryProfileStore implements ProfileStore {
     const subject = this.subjectsByHandle.get(handle);
     const record = subject ? this.records.get(subject) : undefined;
     const enabled = page === 'sessions' ? record?.profile.share_sessions : record?.profile.share_projects;
-    if (!record?.snapshot || record.profile.visibility !== 'details' || !enabled) return null;
+    if (!record?.snapshot || record.profile.visibility !== 'details' || !enabled || !audienceAllows(record.profile, viewer)) return null;
     return this.getPrivateAnalytics(subject!);
   }
 
-  async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {
+  async getPublicProfile(rawHandle: string, viewer?: ProfileViewer): Promise<PublicProfile | null> {
     let handle: string;
     try {
       handle = normalizeHandle(rawHandle);
@@ -300,13 +334,14 @@ export class MemoryProfileStore implements ProfileStore {
     }
     const subject = this.subjectsByHandle.get(handle);
     const record = subject ? this.records.get(subject) : undefined;
-    if (!record?.snapshot || record.profile.visibility === 'private') return null;
+    if (!record?.snapshot || record.profile.visibility === 'private' || !audienceAllows(record.profile, viewer)) return null;
     const snapshot = clone(record.snapshot);
     if (record.profile.visibility === 'totals') delete snapshot.details;
     return clone({
       handle: record.profile.handle,
       display_name: record.profile.display_name,
       visibility: record.profile.visibility,
+      audience: record.profile.audience,
       share_sessions: record.profile.visibility === 'details' && record.profile.share_sessions,
       share_projects: record.profile.visibility === 'details' && record.profile.share_projects,
       snapshot,
@@ -316,7 +351,7 @@ export class MemoryProfileStore implements ProfileStore {
   async getLeaderboard(metric: LeaderboardMetric, limit: number): Promise<LeaderboardUser[]> {
     const key = metric === 'tokens' ? 'total_tokens' : metric === 'cost' ? 'total_cost' : 'total_sessions';
     return [...this.records.values()]
-      .filter(record => record.profile.visibility !== 'private' && record.profile.leaderboard_opt_in && record.snapshot)
+      .filter(record => record.profile.visibility !== 'private' && record.profile.audience === 'public' && record.profile.leaderboard_opt_in && record.snapshot)
       .map(record => ({
         handle: record.profile.handle,
         display_name: record.profile.display_name,
@@ -369,6 +404,10 @@ export class PostgresProfileStore implements ProfileStore {
       );
       ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_sessions BOOLEAN NOT NULL DEFAULT false;
       ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS share_projects BOOLEAN NOT NULL DEFAULT false;
+      ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS audience TEXT NOT NULL DEFAULT 'public'
+        CHECK (audience IN ('public', 'selected'));
+      ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS allowed_emails TEXT[] NOT NULL DEFAULT '{}';
+      ALTER TABLE share_profiles ADD COLUMN IF NOT EXISTS allowed_group_ids TEXT[] NOT NULL DEFAULT '{}';
       CREATE UNIQUE INDEX IF NOT EXISTS share_profiles_handle_lower_idx ON share_profiles (LOWER(handle));
       CREATE TABLE IF NOT EXISTS public_snapshots (
         subject TEXT PRIMARY KEY REFERENCES share_profiles(subject) ON DELETE CASCADE,
@@ -428,7 +467,7 @@ export class PostgresProfileStore implements ProfileStore {
   async getSharing(subject: string): Promise<SharingProfile | null> {
     const result = await this.pool.query(
       `SELECT p.subject, p.handle, p.display_name, p.visibility, p.leaderboard_opt_in,
-              p.share_sessions, p.share_projects,
+              p.share_sessions, p.share_projects, p.audience, p.allowed_emails, p.allowed_group_ids,
               s.generated_at
          FROM share_profiles p LEFT JOIN public_snapshots s USING (subject)
         WHERE p.subject = $1`,
@@ -442,17 +481,26 @@ export class PostgresProfileStore implements ProfileStore {
     try {
       await this.pool.query(
         `INSERT INTO share_profiles
-           (subject, handle, display_name, visibility, leaderboard_opt_in, share_sessions, share_projects)
+           (subject, handle, display_name, visibility, leaderboard_opt_in, share_sessions, share_projects,
+            audience, allowed_emails, allowed_group_ids)
          VALUES (
-           $1, $2, $3, COALESCE($4, 'private'), COALESCE($5, false),
+           $1, $2, $3, COALESCE($4, 'private'),
+           CASE WHEN COALESCE($9, 'public') = 'public' AND COALESCE($4, 'private') <> 'private'
+             THEN COALESCE($5, false) ELSE false END,
            CASE WHEN COALESCE($4, 'private') = 'details' THEN COALESCE($6, false) ELSE false END,
-           CASE WHEN COALESCE($4, 'private') = 'details' THEN COALESCE($7, false) ELSE false END
+           CASE WHEN COALESCE($4, 'private') = 'details' THEN COALESCE($7, false) ELSE false END,
+           COALESCE($9, 'public'), COALESCE($10::text[], '{}'), COALESCE($11::text[], '{}')
          )
          ON CONFLICT (subject) DO UPDATE SET
            handle = EXCLUDED.handle,
            display_name = CASE WHEN $8 THEN EXCLUDED.display_name ELSE share_profiles.display_name END,
            visibility = COALESCE($4, share_profiles.visibility),
-           leaderboard_opt_in = COALESCE($5, share_profiles.leaderboard_opt_in),
+           audience = COALESCE($9, share_profiles.audience),
+           allowed_emails = COALESCE($10::text[], share_profiles.allowed_emails),
+           allowed_group_ids = COALESCE($11::text[], share_profiles.allowed_group_ids),
+           leaderboard_opt_in = CASE
+             WHEN COALESCE($9, share_profiles.audience) = 'public' AND COALESCE($4, share_profiles.visibility) <> 'private'
+               THEN COALESCE($5, share_profiles.leaderboard_opt_in) ELSE false END,
            share_sessions = CASE
              WHEN COALESCE($4, share_profiles.visibility) = 'details' THEN COALESCE($6, share_profiles.share_sessions)
              ELSE false
@@ -466,6 +514,7 @@ export class PostgresProfileStore implements ProfileStore {
           subject, handle, update.display_name ?? null, update.visibility ?? null,
           update.leaderboard_opt_in ?? null, update.share_sessions ?? null, update.share_projects ?? null,
           update.display_name !== undefined,
+          update.audience ?? null, update.allowed_emails ?? null, update.allowed_group_ids ?? null,
         ],
       );
     } catch (error) {
@@ -546,7 +595,7 @@ export class PostgresProfileStore implements ProfileStore {
     }] : [];
   }
 
-  async getPublicAnalytics(rawHandle: string, page: PublicAnalyticsPage): Promise<PrivateAnalyticsSnapshotV1 | null> {
+  async getPublicAnalytics(rawHandle: string, page: PublicAnalyticsPage, viewer?: ProfileViewer): Promise<PrivateAnalyticsSnapshotV1 | null> {
     let handle: string;
     try {
       handle = normalizeHandle(rawHandle);
@@ -563,8 +612,9 @@ export class PostgresProfileStore implements ProfileStore {
          LEFT JOIN private_analytics_device_aliases a
            ON a.subject = d.subject AND a.alias_device_id = d.device_id
         WHERE LOWER(p.handle) = $1 AND p.visibility = 'details' AND p.${flag} = true
+          AND ${AUDIENCE_SQL}
         ORDER BY d.device_id ASC`,
-      [handle],
+      viewerParameters(handle, viewer),
     );
     if (devices.rows.length > 0) return aggregatePrivateAnalytics(deviceSnapshotsFromRows(devices.rows));
 
@@ -573,13 +623,14 @@ export class PostgresProfileStore implements ProfileStore {
          FROM share_profiles p
          JOIN public_snapshots ps USING (subject)
          JOIN private_analytics_snapshots a USING (subject)
-        WHERE LOWER(p.handle) = $1 AND p.visibility = 'details' AND p.${flag} = true`,
-      [handle],
+        WHERE LOWER(p.handle) = $1 AND p.visibility = 'details' AND p.${flag} = true
+          AND ${AUDIENCE_SQL}`,
+      viewerParameters(handle, viewer),
     );
     return legacy.rows[0] ? legacy.rows[0].snapshot as PrivateAnalyticsSnapshotV1 : null;
   }
 
-  async getPublicProfile(rawHandle: string): Promise<PublicProfile | null> {
+  async getPublicProfile(rawHandle: string, viewer?: ProfileViewer): Promise<PublicProfile | null> {
     let handle: string;
     try {
       handle = normalizeHandle(rawHandle);
@@ -587,10 +638,10 @@ export class PostgresProfileStore implements ProfileStore {
       return null;
     }
     const result = await this.pool.query(
-      `SELECT p.handle, p.display_name, p.visibility, p.share_sessions, p.share_projects, s.snapshot
+      `SELECT p.handle, p.display_name, p.visibility, p.audience, p.share_sessions, p.share_projects, s.snapshot
          FROM share_profiles p JOIN public_snapshots s USING (subject)
-        WHERE LOWER(p.handle) = $1 AND p.visibility <> 'private'`,
-      [handle],
+        WHERE LOWER(p.handle) = $1 AND p.visibility <> 'private' AND ${AUDIENCE_SQL}`,
+      viewerParameters(handle, viewer),
     );
     if (!result.rows[0]) return null;
     const snapshot = result.rows[0].snapshot as PublicSnapshotV1;
@@ -599,6 +650,7 @@ export class PostgresProfileStore implements ProfileStore {
       handle: result.rows[0].handle,
       display_name: result.rows[0].display_name,
       visibility: result.rows[0].visibility,
+      audience: result.rows[0].audience,
       share_sessions: result.rows[0].visibility === 'details' && Boolean(result.rows[0].share_sessions),
       share_projects: result.rows[0].visibility === 'details' && Boolean(result.rows[0].share_projects),
       snapshot,
@@ -610,7 +662,7 @@ export class PostgresProfileStore implements ProfileStore {
     const result = await this.pool.query(
       `SELECT p.handle, p.display_name, s.${column}::double precision AS value, s.generated_at
          FROM share_profiles p JOIN public_snapshots s USING (subject)
-        WHERE p.visibility <> 'private' AND p.leaderboard_opt_in = true
+        WHERE p.visibility <> 'private' AND p.audience = 'public' AND p.leaderboard_opt_in = true
         ORDER BY s.${column} DESC, p.handle ASC LIMIT $1`,
       [limit],
     );
@@ -649,6 +701,9 @@ function profileFromRow(row: Record<string, unknown>): SharingProfile {
     handle: String(row.handle),
     display_name: row.display_name === null ? null : String(row.display_name),
     visibility: row.visibility as ShareVisibility,
+    audience: row.audience as ShareAudience,
+    allowed_emails: row.allowed_emails as string[],
+    allowed_group_ids: row.allowed_group_ids as string[],
     leaderboard_opt_in: Boolean(row.leaderboard_opt_in),
     share_sessions: Boolean(row.share_sessions),
     share_projects: Boolean(row.share_projects),
